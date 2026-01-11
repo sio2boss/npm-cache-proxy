@@ -39,10 +39,16 @@ NCP binaries for different paltforms can be downloaded can be downloaded on the 
 The quickies way to get started with NCP is to use Docker.
 
 ```bash
-# run proxy inside of docker container in background
+# Run proxy inside of docker container in background
 docker run -e REDIS_ADDRESS=host.docker.internal:6379 -p 8080:8080 -it -d pkgems/npm-cache-proxy
 
-# configure npm to use caching proxy as registry
+# Run locally with Redis (default)
+ncp --redis-address localhost:6379
+
+# Run locally with SQLite and human-readable logging
+ncp --dev 
+
+# Configure npm to use caching proxy as registry
 npm config set registry http://localhost:8080
 ```
 
@@ -52,31 +58,86 @@ npm config set registry http://localhost:8080
 NCP provides command line interface for interaction with a cached data.
 
 <details>
-<summary>Options</summary>
 
-| Options                       | Env                | Default                      | Description                         |
-| ----------------------------- | ------------------ | ---------------------------- | ----------------------------------- |
-| `--listen <address>`          | `LISTEN_ADDRESS`   | `locahost:8080`              | Address to listen                   |
-| `--upstream <address>`        | `UPSTREAM_ADDRESS` | `https://registry.npmjs.org` | Upstream registry address           |
-| `--silent <address>`          | `SILENT`           | `0`                          | Disable logs                        |
-| `--cache-limit <count>`       | `CACHE_LIMIT`      | -                            | Cached packages count limit         |
-| `--cache-ttl <timeout>`       | `CACHE_TTL`        | `3600`                       | Cache expiration timeout in seconds |
-| `--redis-address <address>`   | `REDIS_ADDRESS`    | `http://localhost:6379`      | Redis address                       |
-| `--redis-database <database>` | `REDIS_DATABASE`   | `0`                          | Redis database                      |
-| `--redis-password <password>` | `REDIS_PASSWORD`   | -                            | Redis password                      |
-| `--redis-prefix <prefix>`     | `REDIS_PREFIX`     | `ncp-`                       | Redis keys prefix                   |
+```
+$ ./ncp --help
+ncp - A fast npm cache proxy that supports Redis and SQLite storage backends.
+
+Usage:
+  ncp [options]
+  ncp list [options]
+  ncp purge [options]
+
+Commands:
+  ncp              Start the npm cache proxy server
+  ncp list         List all cached paths
+  ncp purge        Purge all cached paths
+
+Options:
+  -h, --help                          Show this help message
+  
+  Common Options:
+  --listen <address>                  Address to listen on [default: localhost:8080]
+  --upstream <address>                Upstream registry address [default: https://registry.npmjs.org]
+  --silent                            Disable logging
+  --dev                               Use development logger format (human-readable)
+  --cache-limit <count>               Cached packages count limit [default: 0]
+  --cache-ttl <timeout>               Cache expiration timeout in seconds [default: 3600]
+  --storage-backend <backend>         Storage backend (redis or sqlite) [default: sqlite]
+  
+  Redis Options:
+  --redis-address <address>          Redis server address [default: localhost:6379]
+  --redis-database <db>               Redis database number [default: 0]
+  --redis-password <password>         Redis password
+  --redis-prefix <prefix>             Redis keys prefix [default: ncp-]
+  
+  SQLite Options:
+  --sqlite-db-path <path>             SQLite database file path [default: ./data/cache.db]
+  --package-dir <dir>                 Directory for package storage [default: ./data/packages]
+  --sqlite-checkpoint-interval <dur>   WAL checkpoint interval [default: 5m]
+  --sqlite-cleanup-interval <dur>     Expired entry cleanup interval [default: 1h]
+  --sqlite-wal-size-alert-mb <mb>     Alert threshold for WAL file size in MB [default: 50]
+  --sqlite-max-open-conns <n>         Maximum open connections [default: 25]
+  --sqlite-max-idle-conns <n>         Maximum idle connections [default: 5]
+  --sqlite-conn-max-lifetime <dur>    Connection max lifetime [default: 5m]
+
+Environment Variables:
+  Common:
+  LISTEN_ADDRESS                      Address to listen on
+  UPSTREAM_ADDRESS                    Upstream registry address
+  SILENT                              Disable logging (set to "1" or "true")
+  DEV                                 Use development logger format (set to "1" or "true")
+  CACHE_LIMIT                         Cached packages count limit
+  CACHE_TTL                           Cache expiration timeout in seconds
+  STORAGE_BACKEND                     Storage backend (redis or sqlite)
+  
+  Redis:
+  REDIS_ADDRESS                       Redis server address
+  REDIS_DATABASE                      Redis database number
+  REDIS_PASSWORD                      Redis password
+  REDIS_PREFIX                        Redis keys prefix
+  
+  SQLite:
+  SQLITE_DB_PATH                      SQLite database file path
+  PACKAGE_DIR                         Directory for package storage
+  SQLITE_CHECKPOINT_INTERVAL          WAL checkpoint interval
+  SQLITE_CLEANUP_INTERVAL             Expired entry cleanup interval
+  SQLITE_WAL_SIZE_ALERT_MB            Alert threshold for WAL file size in MB
+  SQLITE_MAX_OPEN_CONNS               Maximum open connections
+  SQLITE_MAX_IDLE_CONNS               Maximum idle connections
+  SQLITE_CONN_MAX_LIFETIME            Connection max lifetime
+```
 
 </details>
 
 #### `ncp`
-Start NCP server.
+Start NCP server with default options (SQLite)
 
 #### `ncp list`
 List cached url paths.
 
 #### `ncp purge`
 Purge cached url paths.
-
 
 <br />
 

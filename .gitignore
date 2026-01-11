@@ -13,6 +13,13 @@
 
 # Build
 build/
+release/
+ncp
+data/
 
 # APFS cache
 .DS_Store
+
+# Node modules in example directory
+example/node_modules/
+example/package-lock.json
