@@ -200,14 +200,20 @@ func (proxy Proxy) fetchTarball(options Options, path string, request *http.Requ
 
 // fetchTarballToFile downloads a tarball and streams it directly to a file.
 // Returns the file path and error. This is more efficient for large files.
+// IMPORTANT: npm tarballs (.tgz) are already gzipped tar archives. We should NOT
+// decompress them - save them exactly as received. The Content-Encoding header
+// indicates HTTP-level compression, which we handle, but the underlying .tgz
+// file must remain compressed.
 func (proxy Proxy) fetchTarballToFile(options Options, path string, request *http.Request, filePath string) (int64, error) {
 	req, err := http.NewRequest("GET", options.UpstreamAddress+path, nil)
 	if err != nil {
 		return 0, err
 	}
 
-	req.Header = request.Header
-	req.Header.Set("Accept-Encoding", "gzip")
+	// Copy headers but don't request gzip compression - npm tarballs are already compressed
+	req.Header = request.Header.Clone()
+	// Remove Accept-Encoding to avoid HTTP-level compression that would require decompression
+	req.Header.Del("Accept-Encoding")
 
 	res, err := proxy.HttpClient.Do(req)
 	if err != nil {
@@ -226,13 +232,15 @@ func (proxy Proxy) fetchTarballToFile(options Options, path string, request *htt
 	if err != nil {
 		return 0, fmt.Errorf("failed to create file: %w", err)
 	}
-	defer file.Close()
 
+	// Handle HTTP-level compression if present (though npm registry typically doesn't use it)
 	var reader io.Reader = res.Body
 	if res.Header.Get("Content-Encoding") == "gzip" {
 		zr, err := gzip.NewReader(res.Body)
 		if err != nil {
-			return 0, err
+			file.Close()
+			os.Remove(filePath)
+			return 0, fmt.Errorf("failed to create gzip reader: %w", err)
 		}
 		defer zr.Close()
 		reader = zr
@@ -241,8 +249,22 @@ func (proxy Proxy) fetchTarballToFile(options Options, path string, request *htt
 	// Stream directly to file instead of loading into memory
 	written, err := io.Copy(file, reader)
 	if err != nil {
+		file.Close()
 		os.Remove(filePath) // Clean up partial file on error
-		return 0, err
+		return 0, fmt.Errorf("failed to write file: %w", err)
+	}
+
+	// CRITICAL: Sync file to disk before closing to ensure all data is written
+	if err := file.Sync(); err != nil {
+		file.Close()
+		os.Remove(filePath)
+		return 0, fmt.Errorf("failed to sync file: %w", err)
+	}
+
+	// Close file before returning
+	if err := file.Close(); err != nil {
+		os.Remove(filePath)
+		return 0, fmt.Errorf("failed to close file: %w", err)
 	}
 
 	return written, nil
@@ -281,6 +303,20 @@ func (proxy Proxy) fetchAndCacheTarball(options Options, path string, request *h
 	if err != nil {
 		log.Printf("Error: Failed to fetch tarball %s: %v", path, err)
 		return nil, err
+	}
+
+	// Verify file was written and is not empty
+	if written == 0 {
+		os.Remove(filePath)
+		return nil, fmt.Errorf("downloaded tarball is empty")
+	}
+
+	// Verify file exists and has correct size
+	if fileInfo, err := os.Stat(filePath); err != nil {
+		return nil, fmt.Errorf("failed to verify cached file: %w", err)
+	} else if fileInfo.Size() != written {
+		os.Remove(filePath)
+		return nil, fmt.Errorf("file size mismatch: expected %d, got %d", written, fileInfo.Size())
 	}
 
 	log.Printf("Cached tarball: %s -> %s (%d bytes)", path, filePath, written)

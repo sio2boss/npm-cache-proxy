@@ -53,7 +53,13 @@ func (proxy Proxy) Server(options ServerOptions) *http.Server {
 			if c.Request.URL.RawQuery != "" {
 				fullURL += "?" + c.Request.URL.RawQuery
 			}
-			fmt.Printf("[DEBUG] %s %s (Host: %s)\n", c.Request.Method, fullURL, c.Request.Host)
+			// Pad method to 4 characters to match INFO log format alignment
+			method := strings.ToUpper(c.Request.Method)
+			methodPadded := fmt.Sprintf("%-4s", method)
+			if len(methodPadded) > 4 {
+				methodPadded = methodPadded[:4]
+			}
+			fmt.Printf("[DEBUG] %s %s (Host: %s)\n", methodPadded, fullURL, c.Request.Host)
 			c.Next()
 		})
 	}
@@ -117,10 +123,6 @@ func (proxy Proxy) noRouteHandler(options ServerOptions) gin.HandlerFunc {
 				}
 				c.AbortWithError(500, err)
 				return
-			}
-			
-			if options.Dev {
-				fmt.Printf("[DEBUG] Handling tarball request: %s (PackageDir: %s)\n", c.Request.URL.Path, opts.PackageDir)
 			}
 			
 			result, err := proxy.GetCachedTarball(opts, c.Request.URL.Path, c.Request)
