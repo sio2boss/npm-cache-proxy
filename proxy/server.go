@@ -123,7 +123,7 @@ func (proxy Proxy) noRouteHandler(options ServerOptions) gin.HandlerFunc {
 				fmt.Printf("[DEBUG] Handling tarball request: %s (PackageDir: %s)\n", c.Request.URL.Path, opts.PackageDir)
 			}
 			
-			data, err := proxy.GetCachedTarball(opts, c.Request.URL.Path, c.Request)
+			result, err := proxy.GetCachedTarball(opts, c.Request.URL.Path, c.Request)
 			if err != nil {
 				if options.Dev {
 					fmt.Printf("[ERROR] Failed to get cached tarball %s: %v\n", c.Request.URL.Path, err)
@@ -133,8 +133,17 @@ func (proxy Proxy) noRouteHandler(options ServerOptions) gin.HandlerFunc {
 			}
 			
 			c.Header("Cache-Control", "public, max-age="+strconv.Itoa(int(opts.DatabaseExpiration.Seconds())))
-			c.Header("Content-Type", "application/octet-stream")
-			c.Data(200, "application/octet-stream", data)
+			
+			// Stream file directly if we have a file path (zero-copy, minimal memory)
+			// Fall back to in-memory response if no file path available
+			if result.FilePath != "" {
+				// Use http.ServeFile for efficient streaming with sendfile() syscall
+				c.Header("Content-Type", "application/octet-stream")
+				http.ServeFile(c.Writer, c.Request, result.FilePath)
+			} else {
+				// Fallback: serve from memory (when PackageDir not configured)
+				c.Data(200, "application/octet-stream", result.Data)
+			}
 		} else if c.Request.URL.Path == "/" {
 			// get health
 			err := proxy.Database.Health()

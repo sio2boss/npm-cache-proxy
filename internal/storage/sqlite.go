@@ -10,8 +10,49 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/tursodatabase/turso-go"
+	_ "modernc.org/sqlite" // Pure-Go SQLite driver, no CGO required
 )
+
+// isRetryableError checks if an error is a retryable SQLite lock error
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// Check for common SQLite lock/busy error messages
+	return strings.Contains(errStr, "database is locked") ||
+		strings.Contains(errStr, "Busy") ||
+		strings.Contains(errStr, "busy") ||
+		strings.Contains(errStr, "SQLITE_BUSY") ||
+		strings.Contains(errStr, "SQLITE_LOCKED")
+}
+
+// retryOperation executes a database operation with exponential backoff retry logic
+func retryOperation(maxRetries int, operation func() error) error {
+	var lastErr error
+	backoff := 10 * time.Millisecond
+	
+	for i := 0; i < maxRetries; i++ {
+		err := operation()
+		if err == nil {
+			return nil
+		}
+		
+		// Only retry if it's a retryable error
+		if !isRetryableError(err) {
+			return err
+		}
+		
+		lastErr = err
+		if i < maxRetries-1 {
+			// Exponential backoff: 10ms, 20ms, 40ms, 80ms, etc.
+			time.Sleep(backoff)
+			backoff *= 2
+		}
+	}
+	
+	return lastErr
+}
 
 // SQLiteStorage implements Storage interface for SQLite database using Turso (in-process SQLite).
 type SQLiteStorage struct {
@@ -20,37 +61,46 @@ type SQLiteStorage struct {
 	packageDir            string
 	checkpointInterval    time.Duration
 	cleanupInterval       time.Duration
+	accessFlushInterval   time.Duration
 	walSizeAlertMB        int
 	stopCheckpoint        chan struct{}
 	stopCleanup           chan struct{}
+	stopAccessFlush       chan struct{}
 	checkpointWg          sync.WaitGroup
 	cleanupWg             sync.WaitGroup
+	accessFlushWg         sync.WaitGroup
 	mu                    sync.RWMutex
+	
+	// In-memory access tracking - stores key -> last access time (Unix timestamp)
+	// This eliminates per-request database writes for sliding expiration
+	accessTimes           sync.Map
 }
 
 // SQLiteConfig provides configuration for SQLite storage.
 type SQLiteConfig struct {
-	DBPath             string
-	PackageDir         string
-	CheckpointInterval time.Duration
-	CleanupInterval    time.Duration
-	WALSizeAlertMB     int
-	MaxOpenConns       int
-	MaxIdleConns       int
-	ConnMaxLifetime    time.Duration
+	DBPath              string
+	PackageDir          string
+	CheckpointInterval  time.Duration
+	CleanupInterval     time.Duration
+	AccessFlushInterval time.Duration // How often to flush in-memory access times to SQLite
+	WALSizeAlertMB      int
+	MaxOpenConns        int
+	MaxIdleConns        int
+	ConnMaxLifetime     time.Duration
 }
 
 // DefaultSQLiteConfig returns default SQLite configuration.
 func DefaultSQLiteConfig() SQLiteConfig {
 	return SQLiteConfig{
-		DBPath:             "./data/cache.db",
-		PackageDir:         "./data/packages",
-		CheckpointInterval: 5 * time.Minute,
-		CleanupInterval:    1 * time.Hour,
-		WALSizeAlertMB:     50,
-		MaxOpenConns:       25,
-		MaxIdleConns:       5,
-		ConnMaxLifetime:    5 * time.Minute,
+		DBPath:              "./data/cache.db",
+		PackageDir:          "./data/packages",
+		CheckpointInterval:  5 * time.Minute,
+		CleanupInterval:     1 * time.Hour,
+		AccessFlushInterval: 30 * time.Second, // Flush access times every 30 seconds
+		WALSizeAlertMB:      50,
+		MaxOpenConns:        25,
+		MaxIdleConns:        5,
+		ConnMaxLifetime:     5 * time.Minute,
 	}
 }
 
@@ -67,9 +117,8 @@ func NewSQLiteStorage(config SQLiteConfig) (*SQLiteStorage, error) {
 		return nil, fmt.Errorf("failed to create package directory: %w", err)
 	}
 
-	// Open database connection using Turso driver (in-process SQLite)
-	// Turso supports WAL mode and better concurrency than standard SQLite
-	db, err := sql.Open("turso", config.DBPath)
+	// Open database connection using modernc.org/sqlite driver (pure-Go, no CGO)
+	db, err := sql.Open("sqlite", config.DBPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
@@ -79,15 +128,23 @@ func NewSQLiteStorage(config SQLiteConfig) (*SQLiteStorage, error) {
 	db.SetMaxIdleConns(config.MaxIdleConns)
 	db.SetConnMaxLifetime(config.ConnMaxLifetime)
 
+	// Ensure access flush interval has a default value
+	accessFlushInterval := config.AccessFlushInterval
+	if accessFlushInterval == 0 {
+		accessFlushInterval = 30 * time.Second // Default: flush every 30 seconds
+	}
+
 	storage := &SQLiteStorage{
-		db:                 db,
-		dbPath:             config.DBPath,
-		packageDir:         config.PackageDir,
-		checkpointInterval: config.CheckpointInterval,
-		cleanupInterval:    config.CleanupInterval,
-		walSizeAlertMB:     config.WALSizeAlertMB,
-		stopCheckpoint:    make(chan struct{}),
-		stopCleanup:        make(chan struct{}),
+		db:                  db,
+		dbPath:              config.DBPath,
+		packageDir:          config.PackageDir,
+		checkpointInterval:  config.CheckpointInterval,
+		cleanupInterval:     config.CleanupInterval,
+		accessFlushInterval: accessFlushInterval,
+		walSizeAlertMB:      config.WALSizeAlertMB,
+		stopCheckpoint:      make(chan struct{}),
+		stopCleanup:         make(chan struct{}),
+		stopAccessFlush:     make(chan struct{}),
 	}
 
 	// Initialize schema
@@ -105,6 +162,7 @@ func NewSQLiteStorage(config SQLiteConfig) (*SQLiteStorage, error) {
 	// Start background jobs
 	storage.startCheckpointManager()
 	storage.startCleanupJob()
+	storage.startAccessFlushJob()
 
 	return storage, nil
 }
@@ -150,23 +208,27 @@ func (s *SQLiteStorage) initSchema() error {
 	return err
 }
 
-// configurePragmas sets SQLite configuration pragmas.
-// Note: Turso may not support all standard SQLite pragmas, so we handle errors gracefully
+// configurePragmas sets SQLite configuration pragmas for optimal performance.
 func (s *SQLiteStorage) configurePragmas() error {
-	// Try to set WAL mode first (Turso should support this)
-	// If it fails, log a warning but continue - Turso may handle WAL mode automatically
+	// Set WAL mode for better concurrency (concurrent reads, single writer)
 	if _, err := s.db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		// Check if database is already in WAL mode or if Turso handles it differently
+		// Check if database is already in WAL mode
 		var journalMode string
 		if checkErr := s.db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); checkErr == nil {
 			if journalMode == "wal" || journalMode == "WAL" {
 				// Already in WAL mode, that's fine
-				return nil
+			} else {
+				fmt.Printf("Warning: Could not set journal_mode to WAL: %v\n", err)
 			}
 		}
-		// If setting WAL fails and we're not already in WAL, log warning but don't fail
-		// Turso may handle WAL mode automatically or have different requirements
-		fmt.Printf("Warning: Could not set journal_mode to WAL: %v (continuing anyway - Turso may handle this automatically)\n", err)
+	}
+
+	// Set busy_timeout to allow SQLite to wait and retry when database is locked
+	// This is critical for handling concurrent access - SQLite will wait up to 5 seconds
+	// before returning "database is locked" error
+	if _, err := s.db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		// Log warning but don't fail - some SQLite versions may not support this
+		fmt.Printf("Warning: Could not set busy_timeout: %v (continuing anyway)\n", err)
 	}
 
 	// Try optional pragmas that may not be supported by Turso
@@ -192,12 +254,23 @@ func (s *SQLiteStorage) Get(key string) (string, error) {
 		return s.getTarballMetadata(key)
 	}
 
-	// Regular registry cache lookup
+	// Regular registry cache lookup with retry logic
 	now := time.Now().Unix()
 	query := `SELECT value FROM registry_cache WHERE key = ? AND expires_at > ?`
 
 	var value string
-	err := s.db.QueryRow(query, key, now).Scan(&value)
+	var err error
+	
+	// Retry up to 3 times for lock errors
+	err = retryOperation(3, func() error {
+		err := s.db.QueryRow(query, key, now).Scan(&value)
+		if err == sql.ErrNoRows {
+			// Don't retry "not found" errors
+			return err
+		}
+		return err
+	})
+	
 	if err == sql.ErrNoRows {
 		return "", fmt.Errorf("key not found")
 	}
@@ -209,70 +282,11 @@ func (s *SQLiteStorage) Get(key string) (string, error) {
 }
 
 // RefreshExpiration updates the expiration time for an existing key (sliding expiration).
+// This is now a fast in-memory operation - access times are flushed to SQLite periodically.
 func (s *SQLiteStorage) RefreshExpiration(key string, expiration time.Duration) error {
-	// Check if this is a tarball key (ends with :tarball)
-	if strings.HasSuffix(key, ":tarball") {
-		return s.refreshTarballExpiration(key, expiration)
-	}
-
-	// Regular registry cache expiration refresh
-	now := time.Now()
-	expiresAt := now.Add(expiration).Unix()
-
-	// Update expiration time if key exists
-	result, err := s.db.Exec(`UPDATE registry_cache SET expires_at = ? WHERE key = ? AND expires_at > ?`,
-		expiresAt, key, now.Unix())
-	if err != nil {
-		return fmt.Errorf("failed to refresh expiration: %w", err)
-	}
-
-	// Check if any rows were affected (key exists and wasn't expired)
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-
-	// If no rows affected, key doesn't exist or is expired - that's okay, no-op
-	if rowsAffected == 0 {
-		return nil
-	}
-
-	return nil
-}
-
-// refreshTarballExpiration updates expiration for tarball metadata
-func (s *SQLiteStorage) refreshTarballExpiration(key string, expiration time.Duration) error {
-	// Extract path from key (remove prefix and :tarball suffix)
-	path := strings.TrimPrefix(key, "ncp-")
-	path = strings.TrimSuffix(path, ":tarball")
-	
-	// Parse package name and version from path
-	packageName, version, err := parseTarballPath(path)
-	if err != nil {
-		return fmt.Errorf("failed to parse tarball path: %w", err)
-	}
-
-	now := time.Now()
-	expiresAt := now.Add(expiration).Unix()
-
-	// Update expiration time if entry exists and isn't expired
-	result, err := s.db.Exec(`UPDATE tarballs SET expires_at = ? WHERE package_name = ? AND version = ? AND expires_at > ?`,
-		expiresAt, packageName, version, now.Unix())
-	if err != nil {
-		return fmt.Errorf("failed to refresh tarball expiration: %w", err)
-	}
-
-	// Check if any rows were affected
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-
-	// If no rows affected, entry doesn't exist or is expired - that's okay, no-op
-	if rowsAffected == 0 {
-		return nil
-	}
-
+	// Store access time in memory - no database write!
+	// The background flush job will periodically write these to SQLite
+	s.accessTimes.Store(key, time.Now().Unix())
 	return nil
 }
 
@@ -295,7 +309,17 @@ func (s *SQLiteStorage) getTarballMetadata(key string) (string, error) {
 	query := `SELECT file_path FROM tarballs WHERE package_name = ? AND version = ? AND expires_at > ?`
 
 	var filePath string
-	err = s.db.QueryRow(query, packageName, version, now).Scan(&filePath)
+	
+	// Retry up to 3 times for lock errors
+	err = retryOperation(3, func() error {
+		err := s.db.QueryRow(query, packageName, version, now).Scan(&filePath)
+		if err == sql.ErrNoRows {
+			// Don't retry "not found" errors
+			return err
+		}
+		return err
+	})
+	
 	if err == sql.ErrNoRows {
 		return "", fmt.Errorf("key not found")
 	}
@@ -348,43 +372,54 @@ func (s *SQLiteStorage) Set(key string, value string, expiration time.Duration) 
 		return s.setTarballMetadata(key, value, expiration)
 	}
 
-	// Regular registry cache storage
+	// Regular registry cache storage with retry logic
 	now := time.Now()
 	expiresAt := now.Add(expiration).Unix()
 	createdAt := now.Unix()
 
-	// Use UPDATE then INSERT pattern (more efficient than DELETE then INSERT)
-	// Use a transaction to ensure atomicity
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	// Try UPDATE first (if entry exists, update it)
-	result, err := tx.Exec(`UPDATE registry_cache SET value = ?, created_at = ?, expires_at = ? WHERE key = ?`,
-		value, createdAt, expiresAt, key)
-	if err != nil {
-		return fmt.Errorf("failed to update key: %w", err)
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-
-	// If no rows were updated, insert new entry
-	if rowsAffected == 0 {
-		_, err = tx.Exec(`INSERT INTO registry_cache (key, value, created_at, expires_at) VALUES (?, ?, ?, ?)`,
-			key, value, createdAt, expiresAt)
+	var err error
+	
+	// Retry up to 3 times for lock errors - wrap entire transaction
+	err = retryOperation(3, func() error {
+		// Use UPDATE then INSERT pattern (more efficient than DELETE then INSERT)
+		// Use a transaction to ensure atomicity
+		tx, err := s.db.Begin()
 		if err != nil {
-			return fmt.Errorf("failed to insert key: %w", err)
+			return fmt.Errorf("failed to begin transaction: %w", err)
 		}
-	}
+		defer tx.Rollback()
 
-	// Commit transaction
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		// Try UPDATE first (if entry exists, update it)
+		result, err := tx.Exec(`UPDATE registry_cache SET value = ?, created_at = ?, expires_at = ? WHERE key = ?`,
+			value, createdAt, expiresAt, key)
+		if err != nil {
+			return fmt.Errorf("failed to update key: %w", err)
+		}
+
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to get rows affected: %w", err)
+		}
+
+		// If no rows were updated, insert new entry
+		if rowsAffected == 0 {
+			_, err = tx.Exec(`INSERT INTO registry_cache (key, value, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+				key, value, createdAt, expiresAt)
+			if err != nil {
+				return fmt.Errorf("failed to insert key: %w", err)
+			}
+		}
+
+		// Commit transaction
+		if err = tx.Commit(); err != nil {
+			return fmt.Errorf("failed to commit transaction: %w", err)
+		}
+
+		return nil
+	})
+	
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -412,37 +447,46 @@ func (s *SQLiteStorage) setTarballMetadata(key string, filePath string, expirati
 	expiresAt := now.Add(expiration).Unix()
 	createdAt := now.Unix()
 
-	// Use transaction for atomicity
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	// Try UPDATE first (if entry exists, update it)
-	result, err := tx.Exec(`UPDATE tarballs SET file_path = ?, size = ?, created_at = ?, expires_at = ? WHERE package_name = ? AND version = ?`,
-		filePath, fileInfo.Size(), createdAt, expiresAt, packageName, version)
-	if err != nil {
-		return fmt.Errorf("failed to update tarball metadata: %w", err)
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-
-	// If no rows were updated, insert new entry
-	if rowsAffected == 0 {
-		_, err = tx.Exec(`INSERT INTO tarballs (package_name, version, file_path, size, checksum, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			packageName, version, filePath, fileInfo.Size(), "", createdAt, expiresAt)
+	// Retry up to 3 times for lock errors - wrap entire transaction
+	err = retryOperation(3, func() error {
+		// Use transaction for atomicity
+		tx, err := s.db.Begin()
 		if err != nil {
-			return fmt.Errorf("failed to insert tarball metadata: %w", err)
+			return fmt.Errorf("failed to begin transaction: %w", err)
 		}
-	}
+		defer tx.Rollback()
 
-	// Commit transaction
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		// Try UPDATE first (if entry exists, update it)
+		result, err := tx.Exec(`UPDATE tarballs SET file_path = ?, size = ?, created_at = ?, expires_at = ? WHERE package_name = ? AND version = ?`,
+			filePath, fileInfo.Size(), createdAt, expiresAt, packageName, version)
+		if err != nil {
+			return fmt.Errorf("failed to update tarball metadata: %w", err)
+		}
+
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to get rows affected: %w", err)
+		}
+
+		// If no rows were updated, insert new entry
+		if rowsAffected == 0 {
+			_, err = tx.Exec(`INSERT INTO tarballs (package_name, version, file_path, size, checksum, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				packageName, version, filePath, fileInfo.Size(), "", createdAt, expiresAt)
+			if err != nil {
+				return fmt.Errorf("failed to insert tarball metadata: %w", err)
+			}
+		}
+
+		// Commit transaction
+		if err = tx.Commit(); err != nil {
+			return fmt.Errorf("failed to commit transaction: %w", err)
+		}
+
+		return nil
+	})
+	
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -525,7 +569,10 @@ func (s *SQLiteStorage) Health() error {
 
 // Close gracefully closes the SQLite connection and stops background jobs.
 func (s *SQLiteStorage) Close() error {
-	// Stop background jobs
+	// Stop background jobs - access flush first to ensure final flush happens
+	close(s.stopAccessFlush)
+	s.accessFlushWg.Wait()
+
 	close(s.stopCheckpoint)
 	close(s.stopCleanup)
 
@@ -762,6 +809,117 @@ func (s *SQLiteStorage) cleanupExpired() error {
 		if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
 			fmt.Printf("Warning: failed to remove orphaned tarball %s: %v\n", filePath, err)
 		}
+	}
+
+	return nil
+}
+
+// startAccessFlushJob starts the background job that flushes in-memory access times to SQLite.
+// This enables sliding expiration without per-request database writes.
+func (s *SQLiteStorage) startAccessFlushJob() {
+	s.accessFlushWg.Add(1)
+	go func() {
+		defer s.accessFlushWg.Done()
+
+		ticker := time.NewTicker(s.accessFlushInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := s.flushAccessTimes(); err != nil {
+					fmt.Printf("Error flushing access times: %v\n", err)
+				}
+			case <-s.stopAccessFlush:
+				// Final flush before stopping
+				if err := s.flushAccessTimes(); err != nil {
+					fmt.Printf("Error during final access time flush: %v\n", err)
+				}
+				return
+			}
+		}
+	}()
+}
+
+// flushAccessTimes writes all in-memory access times to SQLite in a single batch.
+// This is much more efficient than per-request writes.
+func (s *SQLiteStorage) flushAccessTimes() error {
+	// Collect all access times from the map
+	type accessEntry struct {
+		key        string
+		accessTime int64
+	}
+	var entries []accessEntry
+
+	s.accessTimes.Range(func(key, value interface{}) bool {
+		entries = append(entries, accessEntry{
+			key:        key.(string),
+			accessTime: value.(int64),
+		})
+		return true
+	})
+
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// Use a transaction for batch update
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Prepare statements for both tables
+	registryStmt, err := tx.Prepare(`UPDATE registry_cache SET expires_at = ? WHERE key = ?`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare registry update: %w", err)
+	}
+	defer registryStmt.Close()
+
+	tarballStmt, err := tx.Prepare(`UPDATE tarballs SET expires_at = ? WHERE package_name = ? AND version = ?`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare tarball update: %w", err)
+	}
+	defer tarballStmt.Close()
+
+	// Calculate a default TTL for the flush (use a generous default)
+	// In practice, the TTL from the original Set() is already stored in expires_at,
+	// and we just need to extend it based on the access time
+	defaultTTL := int64(24 * 60 * 60) // 24 hours in seconds
+
+	for _, entry := range entries {
+		newExpiresAt := entry.accessTime + defaultTTL
+
+		if strings.HasSuffix(entry.key, ":tarball") {
+			// Parse tarball key to get package name and version
+			path := strings.TrimPrefix(entry.key, "ncp-")
+			path = strings.TrimSuffix(path, ":tarball")
+			packageName, version, err := parseTarballPath(path)
+			if err != nil {
+				// Skip invalid keys
+				continue
+			}
+			_, err = tarballStmt.Exec(newExpiresAt, packageName, version)
+			if err != nil {
+				// Log but continue - don't fail the whole batch for one error
+				fmt.Printf("Warning: failed to update tarball expiration for %s: %v\n", entry.key, err)
+			}
+		} else {
+			_, err = registryStmt.Exec(newExpiresAt, entry.key)
+			if err != nil {
+				// Log but continue
+				fmt.Printf("Warning: failed to update registry expiration for %s: %v\n", entry.key, err)
+			}
+		}
+
+		// Remove from map after processing
+		s.accessTimes.Delete(entry.key)
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit access time flush: %w", err)
 	}
 
 	return nil

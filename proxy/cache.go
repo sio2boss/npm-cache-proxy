@@ -84,11 +84,23 @@ func (proxy Proxy) GetCachedPath(options Options, path string, request *http.Req
 	return []byte(pkg), nil
 }
 
-// GetCachedTarball returns cached tarball file for a given url path.
-func (proxy Proxy) GetCachedTarball(options Options, path string, request *http.Request) ([]byte, error) {
+// TarballResult represents the result of a tarball lookup.
+// Either FilePath is set (for streaming from disk) or Data is set (for in-memory response).
+type TarballResult struct {
+	FilePath string // Path to cached file on disk (preferred - enables streaming)
+	Data     []byte // In-memory data (fallback when no PackageDir configured)
+}
+
+// GetCachedTarball returns cached tarball for a given url path.
+// Returns a TarballResult which contains either a file path (for streaming) or in-memory data.
+func (proxy Proxy) GetCachedTarball(options Options, path string, request *http.Request) (*TarballResult, error) {
 	if options.PackageDir == "" {
 		// If no package directory configured, proxy directly without caching
-		return proxy.fetchTarball(options, path, request)
+		data, err := proxy.fetchTarball(options, path, request)
+		if err != nil {
+			return nil, err
+		}
+		return &TarballResult{Data: data}, nil
 	}
 
 	key := options.DatabasePrefix + path
@@ -104,12 +116,11 @@ func (proxy Proxy) GetCachedTarball(options Options, path string, request *http.
 			log.Printf("Warning: Failed to refresh tarball expiration for %s: %v", path, refreshErr)
 		}
 		
-		// Read from filesystem
-		data, err := ioutil.ReadFile(filePath)
-		if err == nil {
-			return data, nil
+		// Verify file exists before returning path
+		if _, statErr := os.Stat(filePath); statErr == nil {
+			return &TarballResult{FilePath: filePath}, nil
 		}
-		// If file read fails, fall through to re-download
+		// If file doesn't exist, fall through to re-download
 	}
 
 	// Tarball not cached or file missing, fetch and cache it
@@ -118,7 +129,7 @@ func (proxy Proxy) GetCachedTarball(options Options, path string, request *http.
 }
 
 // fetchAndCacheTarballWithDedup ensures only one goroutine downloads a given tarball at a time
-func (proxy Proxy) fetchAndCacheTarballWithDedup(options Options, path string, request *http.Request, key, tarballKey string) ([]byte, error) {
+func (proxy Proxy) fetchAndCacheTarballWithDedup(options Options, path string, request *http.Request, key, tarballKey string) (*TarballResult, error) {
 	// Check if another goroutine is already downloading this tarball
 	downloadChan, loaded := proxy.downloadLocks.LoadOrStore(tarballKey, make(chan struct{}))
 	ch := downloadChan.(chan struct{})
@@ -133,8 +144,10 @@ func (proxy Proxy) fetchAndCacheTarballWithDedup(options Options, path string, r
 			if refreshErr := proxy.Database.RefreshExpiration(tarballKey, options.DatabaseExpiration); refreshErr != nil {
 				log.Printf("Warning: Failed to refresh tarball expiration for %s: %v", path, refreshErr)
 			}
-			// Read from filesystem
-			return ioutil.ReadFile(filePath)
+			// Return file path for streaming (don't load into memory)
+			if _, statErr := os.Stat(filePath); statErr == nil {
+				return &TarballResult{FilePath: filePath}, nil
+			}
 		}
 		// If still not cached, fall through to download (shouldn't happen normally)
 		// This could happen if the download failed, so we'll try again
@@ -236,13 +249,17 @@ func (proxy Proxy) fetchTarballToFile(options Options, path string, request *htt
 }
 
 // fetchAndCacheTarball downloads a tarball and caches it to the filesystem.
-// Optimized to stream directly to disk instead of loading into memory.
-func (proxy Proxy) fetchAndCacheTarball(options Options, path string, request *http.Request, key, tarballKey string) ([]byte, error) {
+// Returns the file path for streaming - does NOT load file into memory.
+func (proxy Proxy) fetchAndCacheTarball(options Options, path string, request *http.Request, key, tarballKey string) (*TarballResult, error) {
 	// Check if PackageDir is configured
 	if options.PackageDir == "" {
 		log.Printf("Warning: PackageDir not configured, cannot cache tarball %s", path)
 		// Fall back to in-memory download
-		return proxy.fetchTarball(options, path, request)
+		data, err := proxy.fetchTarball(options, path, request)
+		if err != nil {
+			return nil, err
+		}
+		return &TarballResult{Data: data}, nil
 	}
 
 	// Generate safe filename from path
@@ -276,15 +293,8 @@ func (proxy Proxy) fetchAndCacheTarball(options Options, path string, request *h
 		log.Printf("Warning: failed to store tarball metadata for %s: %v", path, err)
 	}
 
-	// Read file back into memory to return to client
-	// TODO: Consider streaming response directly from file in the future for even better performance
-	data, err := ioutil.ReadFile(filePath)
-	if err != nil {
-		log.Printf("Error: Failed to read cached tarball %s: %v", filePath, err)
-		return nil, err
-	}
-
-	return data, nil
+	// Return file path for streaming - don't load into memory!
+	return &TarballResult{FilePath: filePath}, nil
 }
 
 // ListCachedPaths returns list of all cached url paths.
