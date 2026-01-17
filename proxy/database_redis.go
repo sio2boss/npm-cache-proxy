@@ -21,6 +21,21 @@ func (db DatabaseRedis) Set(key string, value string, expiration time.Duration) 
 	return db.Client.Set(key, value, expiration).Err()
 }
 
+// RefreshExpiration updates the expiration time for an existing key (sliding expiration).
+func (db DatabaseRedis) RefreshExpiration(key string, expiration time.Duration) error {
+	// Check if key exists first
+	exists, err := db.Client.Exists(key).Result()
+	if err != nil {
+		return err
+	}
+	if exists == 0 {
+		// Key doesn't exist, no-op
+		return nil
+	}
+	// Refresh expiration
+	return db.Client.Expire(key, expiration).Err()
+}
+
 // Delete deletes data by key.
 func (db DatabaseRedis) Delete(key string) error {
 	return db.Client.Del(key).Err()

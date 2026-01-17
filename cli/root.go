@@ -1,55 +1,80 @@
 package cli
 
 import (
+	"context"
 	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	npmproxy "github.com/pkgems/npm-cache-proxy/proxy"
-	"github.com/spf13/cobra"
+	"github.com/pkgems/npm-cache-proxy/internal/storage"
 )
 
-// start a server
-var rootCmd = &cobra.Command{
-	Use:   "ncp",
-	Short: "ncp is a fast npm cache proxy that stores data in Redis",
-	Run:   run,
-}
+func runServer(opts Options) {
+	proxy, storageBackend, err := getProxy(opts)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-var rootOptions struct {
-	Silent          bool
-	ListenAddress   string
-	UpstreamAddress string
-	CacheLimit      string
-	CacheTTL        int
-}
+	// Ensure storage is properly typed (needed for import recognition)
+	var _ storage.Storage = storageBackend
 
-func init() {
-	rootCmd.Flags().BoolVar(&rootOptions.Silent, "silent", getEnvBool("SILENT", "0"), "Disable logging")
-	rootCmd.Flags().StringVar(&rootOptions.ListenAddress, "listen", getEnvString("LISTEN_ADDRESS", "localhost:8080"), "Address to listen")
-	rootCmd.Flags().StringVar(&rootOptions.UpstreamAddress, "upstream", getEnvString("UPSTREAM_ADDRESS", "https://registry.npmjs.org"), "Upstream registry address")
-	rootCmd.Flags().StringVar(&rootOptions.CacheLimit, "cache-limit", getEnvString("CACHE_LIMIT", "0"), "Cached packages count limit")
-	rootCmd.Flags().IntVar(&rootOptions.CacheTTL, "cache-ttl", getEnvInt("CACHE_TTL", "3600"), "Cache expiration timeout in seconds")
-}
-
-func run(cmd *cobra.Command, args []string) {
-	proxy := getProxy()
-
-	log.Print("Listening on " + rootOptions.ListenAddress)
-
-	err := proxy.Server(npmproxy.ServerOptions{
-		ListenAddress: rootOptions.ListenAddress,
-		Silent:        rootOptions.Silent,
+	// Create HTTP server
+	server := proxy.Server(npmproxy.ServerOptions{
+		ListenAddress: opts.ListenAddress,
+		Silent:        opts.Silent,
+		Dev:           opts.Dev,
 
 		GetOptions: func() (npmproxy.Options, error) {
 			return npmproxy.Options{
-				DatabasePrefix:     persistentOptions.RedisPrefix,
-				DatabaseExpiration: time.Duration(rootOptions.CacheTTL) * time.Second,
-				UpstreamAddress:    rootOptions.UpstreamAddress,
+				DatabasePrefix:     opts.RedisPrefix,
+				DatabaseExpiration: time.Duration(opts.CacheTTL) * time.Second,
+				UpstreamAddress:    opts.UpstreamAddress,
+				PackageDir:         opts.PackageDir,
 			}, nil
 		},
-	}).ListenAndServe()
+	})
 
-	if err != nil {
-		log.Fatal(err)
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// Start server in a goroutine
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Print("Listening on " + opts.ListenAddress)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- err
+		}
+	}()
+
+	// Wait for interrupt signal or server error
+	select {
+	case sig := <-sigChan:
+		log.Printf("Received signal: %v. Shutting down gracefully...", sig)
+	case err := <-serverErr:
+		log.Printf("Server error: %v. Shutting down...", err)
+	}
+
+	// Gracefully shut down the HTTP server
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Error shutting down HTTP server: %v", err)
+	} else {
+		log.Print("HTTP server shut down successfully")
+	}
+
+	// Close storage backend (important for SQLite to unlock database and perform final checkpoint)
+	if storageBackend != nil {
+		if err := storageBackend.Close(); err != nil {
+			log.Printf("Error closing storage backend: %v", err)
+		} else {
+			log.Print("Storage backend closed successfully")
+		}
 	}
 }
