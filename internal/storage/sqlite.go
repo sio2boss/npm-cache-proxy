@@ -31,18 +31,18 @@ func isRetryableError(err error) bool {
 func retryOperation(maxRetries int, operation func() error) error {
 	var lastErr error
 	backoff := 10 * time.Millisecond
-	
+
 	for i := 0; i < maxRetries; i++ {
 		err := operation()
 		if err == nil {
 			return nil
 		}
-		
+
 		// Only retry if it's a retryable error
 		if !isRetryableError(err) {
 			return err
 		}
-		
+
 		lastErr = err
 		if i < maxRetries-1 {
 			// Exponential backoff: 10ms, 20ms, 40ms, 80ms, etc.
@@ -50,30 +50,36 @@ func retryOperation(maxRetries int, operation func() error) error {
 			backoff *= 2
 		}
 	}
-	
+
 	return lastErr
 }
 
 // SQLiteStorage implements Storage interface for SQLite database using Turso (in-process SQLite).
 type SQLiteStorage struct {
-	db                    *sql.DB
-	dbPath                string
-	packageDir            string
-	checkpointInterval    time.Duration
-	cleanupInterval       time.Duration
-	accessFlushInterval   time.Duration
-	walSizeAlertMB        int
-	stopCheckpoint        chan struct{}
-	stopCleanup           chan struct{}
-	stopAccessFlush       chan struct{}
-	checkpointWg          sync.WaitGroup
-	cleanupWg             sync.WaitGroup
-	accessFlushWg         sync.WaitGroup
-	mu                    sync.RWMutex
-	
-	// In-memory access tracking - stores key -> last access time (Unix timestamp)
-	// This eliminates per-request database writes for sliding expiration
-	accessTimes           sync.Map
+	db                  *sql.DB
+	dbPath              string
+	packageDir          string
+	checkpointInterval  time.Duration
+	cleanupInterval     time.Duration
+	accessFlushInterval time.Duration
+	walSizeAlertMB      int
+	stopCheckpoint      chan struct{}
+	stopCleanup         chan struct{}
+	stopAccessFlush     chan struct{}
+	checkpointWg        sync.WaitGroup
+	cleanupWg           sync.WaitGroup
+	accessFlushWg       sync.WaitGroup
+	mu                  sync.RWMutex
+
+	// accessTimes stores key -> accessRecord for sliding expiration.
+	// Reads record the configured TTL here; a background flush writes expires_at.
+	accessTimes sync.Map
+}
+
+// accessRecord is one sliding-expiration update waiting to be flushed.
+type accessRecord struct {
+	at  int64 // last access, unix seconds
+	ttl int64 // TTL in seconds, from the caller
 }
 
 // SQLiteConfig provides configuration for SQLite storage.
@@ -157,6 +163,13 @@ func NewSQLiteStorage(config SQLiteConfig) (*SQLiteStorage, error) {
 	if err := storage.configurePragmas(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to configure pragmas: %w", err)
+	}
+
+	// Drop rows and tarball files that expired while the process was down,
+	// before background jobs or callers can republish the same paths.
+	if err := storage.cleanupExpired(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to clear expired cache entries: %w", err)
 	}
 
 	// Start background jobs
@@ -260,7 +273,7 @@ func (s *SQLiteStorage) Get(key string) (string, error) {
 
 	var value string
 	var err error
-	
+
 	// Retry up to 3 times for lock errors
 	err = retryOperation(3, func() error {
 		err := s.db.QueryRow(query, key, now).Scan(&value)
@@ -270,7 +283,7 @@ func (s *SQLiteStorage) Get(key string) (string, error) {
 		}
 		return err
 	})
-	
+
 	if err == sql.ErrNoRows {
 		return "", fmt.Errorf("key not found")
 	}
@@ -284,21 +297,25 @@ func (s *SQLiteStorage) Get(key string) (string, error) {
 // RefreshExpiration updates the expiration time for an existing key (sliding expiration).
 // This is now a fast in-memory operation - access times are flushed to SQLite periodically.
 func (s *SQLiteStorage) RefreshExpiration(key string, expiration time.Duration) error {
-	// Store access time in memory - no database write!
-	// The background flush job will periodically write these to SQLite
-	s.accessTimes.Store(key, time.Now().Unix())
+	ttl := int64(expiration / time.Second)
+	if expiration > 0 && ttl == 0 {
+		ttl = 1
+	}
+	s.accessTimes.Store(key, accessRecord{
+		at:  time.Now().Unix(),
+		ttl: ttl,
+	})
 	return nil
 }
 
 // getTarballMetadata retrieves tarball file path from tarballs table
 func (s *SQLiteStorage) getTarballMetadata(key string) (string, error) {
-	// Extract path from key (remove prefix and :tarball suffix)
-	// Key format: "ncp-/js-tokens/-/js-tokens-4.0.0.tgz:tarball"
-	// Path format: "/js-tokens/-/js-tokens-4.0.0.tgz"
-	path := strings.TrimPrefix(key, "ncp-")
-	path = strings.TrimSuffix(path, ":tarball")
-	
-	// Parse package name and version from path
+	// Key format: "{prefix}/js-tokens/-/js-tokens-4.0.0.tgz:tarball"
+	path, err := tarballPathFromKey(key)
+	if err != nil {
+		return "", err
+	}
+
 	// Path format: "/js-tokens/-/js-tokens-4.0.0.tgz" or "/@types/react/-/react-18.2.0.tgz"
 	packageName, version, err := parseTarballPath(path)
 	if err != nil {
@@ -309,7 +326,7 @@ func (s *SQLiteStorage) getTarballMetadata(key string) (string, error) {
 	query := `SELECT file_path FROM tarballs WHERE package_name = ? AND version = ? AND expires_at > ?`
 
 	var filePath string
-	
+
 	// Retry up to 3 times for lock errors
 	err = retryOperation(3, func() error {
 		err := s.db.QueryRow(query, packageName, version, now).Scan(&filePath)
@@ -319,7 +336,7 @@ func (s *SQLiteStorage) getTarballMetadata(key string) (string, error) {
 		}
 		return err
 	})
-	
+
 	if err == sql.ErrNoRows {
 		return "", fmt.Errorf("key not found")
 	}
@@ -330,43 +347,63 @@ func (s *SQLiteStorage) getTarballMetadata(key string) (string, error) {
 	return filePath, nil
 }
 
+// tarballPathFromKey extracts the URL path from a tarball cache key.
+// The storage prefix is not fixed; the path begins at the first '/'.
+// Key format: "{prefix}/js-tokens/-/js-tokens-4.0.0.tgz:tarball"
+func tarballPathFromKey(key string) (string, error) {
+	const suffix = ":tarball"
+	if !strings.HasSuffix(key, suffix) {
+		return "", fmt.Errorf("invalid tarball key %q", key)
+	}
+	trimmed := strings.TrimSuffix(key, suffix)
+	slash := strings.Index(trimmed, "/")
+	if slash < 0 {
+		return "", fmt.Errorf("invalid tarball key %q", key)
+	}
+	return trimmed[slash:], nil
+}
+
 // parseTarballPath extracts package name and version from tarball path
 // Path format: "/js-tokens/-/js-tokens-4.0.0.tgz" or "/@types/react/-/react-18.2.0.tgz"
 func parseTarballPath(path string) (packageName, version string, err error) {
 	// Remove leading slash
 	path = strings.TrimPrefix(path, "/")
-	
+
 	// Split by "/-/"
 	parts := strings.Split(path, "/-/")
 	if len(parts) != 2 {
 		return "", "", fmt.Errorf("invalid tarball path format: %s", path)
 	}
-	
-	packageName = parts[0] // "js-tokens" or "@types/react"
+
+	packageName = parts[0]  // "js-tokens" or "@types/react"
 	tarballName := parts[1] // "js-tokens-4.0.0.tgz" or "react-18.2.0.tgz"
-	
+
 	// Remove .tgz extension
 	tarballName = strings.TrimSuffix(tarballName, ".tgz")
-	
+
 	// Extract version - version is the last part after the last dash
 	// For "js-tokens-4.0.0", version is "4.0.0"
 	// For "react-18.2.0", version is "18.2.0"
 	// But we need to handle scoped packages where the tarball name might not match package name
 	// For "@types/react", tarball is "react-18.2.0", so we need to find the version part
-	
+
 	// Find the last dash and everything after it is the version
 	lastDash := strings.LastIndex(tarballName, "-")
 	if lastDash == -1 {
 		return "", "", fmt.Errorf("invalid tarball name format: %s", tarballName)
 	}
-	
+
 	version = tarballName[lastDash+1:]
-	
+
 	return packageName, version, nil
 }
 
 // Set stores value identified by key with expiration timeout.
+// The lock is shared with cleanup so a tarball file cannot be published onto a path that cleanup is unlinking.
 func (s *SQLiteStorage) Set(key string, value string, expiration time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	// Check if this is a tarball key (ends with :tarball)
 	if strings.HasSuffix(key, ":tarball") {
 		return s.setTarballMetadata(key, value, expiration)
@@ -378,7 +415,7 @@ func (s *SQLiteStorage) Set(key string, value string, expiration time.Duration) 
 	createdAt := now.Unix()
 
 	var err error
-	
+
 	// Retry up to 3 times for lock errors - wrap entire transaction
 	err = retryOperation(3, func() error {
 		// Use UPDATE then INSERT pattern (more efficient than DELETE then INSERT)
@@ -417,7 +454,7 @@ func (s *SQLiteStorage) Set(key string, value string, expiration time.Duration) 
 
 		return nil
 	})
-	
+
 	if err != nil {
 		return err
 	}
@@ -425,13 +462,18 @@ func (s *SQLiteStorage) Set(key string, value string, expiration time.Duration) 
 	return nil
 }
 
-// setTarballMetadata stores tarball metadata in tarballs table
+// setTarballMetadata stores tarball metadata in tarballs table.
+// Caller must hold s.mu.
 func (s *SQLiteStorage) setTarballMetadata(key string, filePath string, expiration time.Duration) error {
-	// Extract path from key (remove prefix and :tarball suffix)
-	path := strings.TrimPrefix(key, "ncp-")
-	path = strings.TrimSuffix(path, ":tarball")
-	
-	// Parse package name and version from path
+	if err := publishPartialTarball(filePath); err != nil {
+		return fmt.Errorf("failed to publish tarball file: %w", err)
+	}
+
+	path, err := tarballPathFromKey(key)
+	if err != nil {
+		return err
+	}
+
 	packageName, version, err := parseTarballPath(path)
 	if err != nil {
 		return fmt.Errorf("failed to parse tarball path: %w", err)
@@ -484,7 +526,7 @@ func (s *SQLiteStorage) setTarballMetadata(key string, filePath string, expirati
 
 		return nil
 	})
-	
+
 	if err != nil {
 		return err
 	}
@@ -511,11 +553,11 @@ func (s *SQLiteStorage) Delete(key string) error {
 
 // deleteTarballMetadata deletes tarball metadata from tarballs table
 func (s *SQLiteStorage) deleteTarballMetadata(key string) error {
-	// Extract path from key (remove prefix and :tarball suffix)
-	path := strings.TrimPrefix(key, "ncp-")
-	path = strings.TrimSuffix(path, ":tarball")
-	
-	// Parse package name and version from path
+	path, err := tarballPathFromKey(key)
+	if err != nil {
+		return err
+	}
+
 	packageName, version, err := parseTarballPath(path)
 	if err != nil {
 		return fmt.Errorf("failed to parse tarball path: %w", err)
@@ -759,59 +801,92 @@ func (s *SQLiteStorage) startCleanupJob() {
 	}()
 }
 
-// cleanupExpired removes expired entries from all tables and orphaned tarball files.
+// cleanupExpired removes expired entries from all tables and their tarball files.
+// Pending sliding-expiration updates are flushed first so a key accessed since the
+// last flush is not deleted. Caller may be startup or the background job.
 func (s *SQLiteStorage) cleanupExpired() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.flushAccessTimesLocked(); err != nil {
+		return err
+	}
+	return s.deleteExpiredLocked()
+}
+
+// deleteExpiredLocked deletes rows whose expires_at has passed and unlinks tarball
+// files for the rows this call removed. Caller must hold s.mu.
+func (s *SQLiteStorage) deleteExpiredLocked() error {
 	now := time.Now().Unix()
 
-	// Delete expired entries from registry_cache
-	_, err := s.db.Exec(`DELETE FROM registry_cache WHERE expires_at <= ?`, now)
+	tx, err := s.db.Begin()
 	if err != nil {
+		return fmt.Errorf("failed to begin cleanup transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM registry_cache WHERE expires_at <= ?`, now); err != nil {
 		return fmt.Errorf("failed to cleanup registry_cache: %w", err)
 	}
 
-	// Delete expired entries from packages_metadata
-	_, err = s.db.Exec(`DELETE FROM packages_metadata WHERE expires_at <= ?`, now)
-	if err != nil {
+	if _, err := tx.Exec(`DELETE FROM packages_metadata WHERE expires_at <= ?`, now); err != nil {
 		return fmt.Errorf("failed to cleanup packages_metadata: %w", err)
 	}
 
-	// Delete expired tarball metadata and remove orphaned files
-	rows, err := s.db.Query(`SELECT file_path FROM tarballs WHERE expires_at <= ?`, now)
+	// RETURNING yields only the rows this statement deleted, and the query is
+	// closed before commit so a single SQLite connection cannot deadlock.
+	rows, err := tx.Query(`DELETE FROM tarballs WHERE expires_at <= ? RETURNING file_path`, now)
 	if err != nil {
-		return fmt.Errorf("failed to query expired tarballs: %w", err)
+		return fmt.Errorf("failed to cleanup tarballs: %w", err)
 	}
-	defer rows.Close() // CRITICAL: Always close rows
 
 	var filesToDelete []string
 	for rows.Next() {
 		var filePath string
 		if err := rows.Scan(&filePath); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to scan expired tarball path: %w", err)
+		}
+		if filePath != "" {
+			filesToDelete = append(filesToDelete, filePath)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("error iterating expired tarballs: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("failed to close expired tarball rows: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit cleanup: %w", err)
+	}
+
+	for _, filePath := range filesToDelete {
+		inUse, err := s.tarballFileReferenced(filePath)
+		if err != nil {
+			fmt.Printf("Warning: failed to check tarball path %s: %v\n", filePath, err)
 			continue
 		}
-		filesToDelete = append(filesToDelete, filePath)
-	}
-
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("error iterating tarball rows: %w", err)
-	}
-
-	// Delete expired tarball metadata
-	_, err = s.db.Exec(`DELETE FROM tarballs WHERE expires_at <= ?`, now)
-	if err != nil {
-		return fmt.Errorf("failed to cleanup tarballs: %w", err)
-	}
-
-	// Remove orphaned tarball files
-	for _, filePath := range filesToDelete {
+		if inUse {
+			continue
+		}
 		if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
-			fmt.Printf("Warning: failed to remove orphaned tarball %s: %v\n", filePath, err)
+			fmt.Printf("Warning: failed to remove expired tarball %s: %v\n", filePath, err)
 		}
 	}
 
 	return nil
+}
+
+// tarballFileReferenced reports whether any tarball row still points at filePath.
+func (s *SQLiteStorage) tarballFileReferenced(filePath string) (bool, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tarballs WHERE file_path = ?`, filePath).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // startAccessFlushJob starts the background job that flushes in-memory access times to SQLite.
@@ -842,20 +917,29 @@ func (s *SQLiteStorage) startAccessFlushJob() {
 }
 
 // flushAccessTimes writes all in-memory access times to SQLite in a single batch.
-// This is much more efficient than per-request writes.
 func (s *SQLiteStorage) flushAccessTimes() error {
-	// Collect all access times from the map
-	type accessEntry struct {
-		key        string
-		accessTime int64
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.flushAccessTimesLocked()
+}
+
+// flushAccessTimesLocked writes pending sliding expirations. Caller must hold s.mu.
+// Records are removed only after commit, and only when the map still holds the
+// value that was written, so a newer access or a failed commit is retried.
+func (s *SQLiteStorage) flushAccessTimesLocked() error {
+	type pendingAccess struct {
+		key    string
+		record accessRecord
 	}
-	var entries []accessEntry
+	var entries []pendingAccess
 
 	s.accessTimes.Range(func(key, value interface{}) bool {
-		entries = append(entries, accessEntry{
-			key:        key.(string),
-			accessTime: value.(int64),
-		})
+		rec, ok := value.(accessRecord)
+		if !ok {
+			s.accessTimes.Delete(key)
+			return true
+		}
+		entries = append(entries, pendingAccess{key: key.(string), record: rec})
 		return true
 	})
 
@@ -863,14 +947,12 @@ func (s *SQLiteStorage) flushAccessTimes() error {
 		return nil
 	}
 
-	// Use a transaction for batch update
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Prepare statements for both tables
 	registryStmt, err := tx.Prepare(`UPDATE registry_cache SET expires_at = ? WHERE key = ?`)
 	if err != nil {
 		return fmt.Errorf("failed to prepare registry update: %w", err)
@@ -883,43 +965,41 @@ func (s *SQLiteStorage) flushAccessTimes() error {
 	}
 	defer tarballStmt.Close()
 
-	// Calculate a default TTL for the flush (use a generous default)
-	// In practice, the TTL from the original Set() is already stored in expires_at,
-	// and we just need to extend it based on the access time
-	defaultTTL := int64(24 * 60 * 60) // 24 hours in seconds
-
+	applied := make([]pendingAccess, 0, len(entries))
 	for _, entry := range entries {
-		newExpiresAt := entry.accessTime + defaultTTL
+		newExpiresAt := entry.record.at + entry.record.ttl
 
 		if strings.HasSuffix(entry.key, ":tarball") {
-			// Parse tarball key to get package name and version
-			path := strings.TrimPrefix(entry.key, "ncp-")
-			path = strings.TrimSuffix(path, ":tarball")
-			packageName, version, err := parseTarballPath(path)
+			path, err := tarballPathFromKey(entry.key)
 			if err != nil {
-				// Skip invalid keys
+				fmt.Printf("Warning: skipping tarball expiration update for %s: %v\n", entry.key, err)
+				s.accessTimes.CompareAndDelete(entry.key, entry.record)
 				continue
 			}
-			_, err = tarballStmt.Exec(newExpiresAt, packageName, version)
+			packageName, version, err := parseTarballPath(path)
 			if err != nil {
-				// Log but continue - don't fail the whole batch for one error
+				fmt.Printf("Warning: skipping tarball expiration update for %s: %v\n", entry.key, err)
+				s.accessTimes.CompareAndDelete(entry.key, entry.record)
+				continue
+			}
+			if _, err = tarballStmt.Exec(newExpiresAt, packageName, version); err != nil {
 				fmt.Printf("Warning: failed to update tarball expiration for %s: %v\n", entry.key, err)
+				continue
 			}
-		} else {
-			_, err = registryStmt.Exec(newExpiresAt, entry.key)
-			if err != nil {
-				// Log but continue
-				fmt.Printf("Warning: failed to update registry expiration for %s: %v\n", entry.key, err)
-			}
+		} else if _, err = registryStmt.Exec(newExpiresAt, entry.key); err != nil {
+			fmt.Printf("Warning: failed to update registry expiration for %s: %v\n", entry.key, err)
+			continue
 		}
 
-		// Remove from map after processing
-		s.accessTimes.Delete(entry.key)
+		applied = append(applied, entry)
 	}
 
-	// Commit the transaction
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit access time flush: %w", err)
+	}
+
+	for _, entry := range applied {
+		s.accessTimes.CompareAndDelete(entry.key, entry.record)
 	}
 
 	return nil

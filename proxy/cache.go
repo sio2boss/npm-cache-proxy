@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/pkgems/npm-cache-proxy/internal/storage"
 )
 
 // GetCachedPath returns cached upstream response for a given url path.
@@ -104,18 +106,18 @@ func (proxy Proxy) GetCachedTarball(options Options, path string, request *http.
 	}
 
 	key := options.DatabasePrefix + path
-	
+
 	// Check if tarball metadata exists in database
 	tarballKey := key + ":tarball"
 	filePath, err := proxy.Database.Get(tarballKey)
-	
+
 	if err == nil && filePath != "" {
 		// Tarball is cached, refresh expiration (sliding expiration)
 		if refreshErr := proxy.Database.RefreshExpiration(tarballKey, options.DatabaseExpiration); refreshErr != nil {
 			// Log but don't fail - caching is best effort
 			log.Printf("Warning: Failed to refresh tarball expiration for %s: %v", path, refreshErr)
 		}
-		
+
 		// Verify file exists before returning path
 		if _, statErr := os.Stat(filePath); statErr == nil {
 			return &TarballResult{FilePath: filePath}, nil
@@ -133,7 +135,7 @@ func (proxy Proxy) fetchAndCacheTarballWithDedup(options Options, path string, r
 	// Check if another goroutine is already downloading this tarball
 	downloadChan, loaded := proxy.downloadLocks.LoadOrStore(tarballKey, make(chan struct{}))
 	ch := downloadChan.(chan struct{})
-	
+
 	if loaded {
 		// Another goroutine is downloading, wait for it to complete
 		<-ch
@@ -153,14 +155,14 @@ func (proxy Proxy) fetchAndCacheTarballWithDedup(options Options, path string, r
 		// This could happen if the download failed, so we'll try again
 		return proxy.fetchAndCacheTarball(options, path, request, key, tarballKey)
 	}
-	
+
 	// We're the first goroutine, do the download
 	defer func() {
 		// Signal other waiting goroutines that download is complete
 		close(ch)
 		proxy.downloadLocks.Delete(tarballKey)
 	}()
-	
+
 	return proxy.fetchAndCacheTarball(options, path, request, key, tarballKey)
 }
 
@@ -289,7 +291,7 @@ func (proxy Proxy) fetchAndCacheTarball(options Options, path string, request *h
 	safePath := strings.TrimPrefix(path, "/")
 	safePath = strings.ReplaceAll(safePath, "/", "_")
 	safePath = strings.ReplaceAll(safePath, "@", "_at_")
-	
+
 	// Ensure safe filename
 	safePath = filepath.Clean(safePath)
 	if strings.Contains(safePath, "..") {
@@ -297,36 +299,36 @@ func (proxy Proxy) fetchAndCacheTarball(options Options, path string, request *h
 	}
 
 	filePath := filepath.Join(options.PackageDir, safePath)
+	// Write beside the final path. Set publishes it under the cleanup lock so
+	// an expiration sweep cannot unlink a file this download just stored.
+	partialPath := storage.TarballPartialPath(filePath)
 
-	// Stream download directly to file (more efficient for large files)
-	written, err := proxy.fetchTarballToFile(options, path, request, filePath)
+	written, err := proxy.fetchTarballToFile(options, path, request, partialPath)
 	if err != nil {
 		log.Printf("Error: Failed to fetch tarball %s: %v", path, err)
 		return nil, err
 	}
 
-	// Verify file was written and is not empty
 	if written == 0 {
-		os.Remove(filePath)
+		os.Remove(partialPath)
 		return nil, fmt.Errorf("downloaded tarball is empty")
 	}
 
-	// Verify file exists and has correct size
-	if fileInfo, err := os.Stat(filePath); err != nil {
+	if fileInfo, err := os.Stat(partialPath); err != nil {
 		return nil, fmt.Errorf("failed to verify cached file: %w", err)
 	} else if fileInfo.Size() != written {
-		os.Remove(filePath)
+		os.Remove(partialPath)
 		return nil, fmt.Errorf("file size mismatch: expected %d, got %d", written, fileInfo.Size())
 	}
 
 	log.Printf("Cached tarball: %s -> %s (%d bytes)", path, filePath, written)
 
-	// Store metadata in database
-	// Store file path with expiration
 	if err := proxy.Database.Set(tarballKey, filePath, options.DatabaseExpiration); err != nil {
-		// If storing metadata fails, log but don't fail the request
-		// The file is cached on disk even if metadata storage fails
 		log.Printf("Warning: failed to store tarball metadata for %s: %v", path, err)
+		if _, statErr := os.Stat(filePath); statErr != nil {
+			os.Remove(partialPath)
+			return nil, err
+		}
 	}
 
 	// Return file path for streaming - don't load into memory!

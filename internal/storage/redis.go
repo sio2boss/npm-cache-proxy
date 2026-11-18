@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis"
@@ -25,6 +26,11 @@ func (s *RedisStorage) Get(key string) (string, error) {
 
 // Set stores value identified by key with expiration timeout.
 func (s *RedisStorage) Set(key string, value string, expiration time.Duration) error {
+	if strings.HasSuffix(key, ":tarball") {
+		if err := publishPartialTarball(value); err != nil {
+			return err
+		}
+	}
 	return s.Client.Set(key, value, expiration).Err()
 }
 
