@@ -1,0 +1,969 @@
+---
+title: npm-cache-proxy
+
+# Product narrative for ncp. Spec: https://github.com/otcom-dev/narrative.yaml
+# A double-bracket reference resolves to a `name` in this file and is an edge in
+# the implementation DAG: definitions / general / technical → architectural →
+# features → flourishes. A `value` is the contract to build and to test.
+# `status` is idea, in-progress, partial, review, or done.
+# This file describes the application as it behaves today. Where the SQLite
+# performance plan decided a stricter contract than the binary implements, the
+# node is partial and the value states both the requirement and the current gap.
+
+definitions:
+  name: Definitions
+  description: |
+    Vocabulary for this file. Read a [[Name]] before acting on a node that cites it.
+  value:
+
+    - name: Narrative
+      value: |
+        This file is the interdisciplinary product narrative for npm-cache-proxy.
+        It is the software in English: who it is for, which technologies are allowed,
+        how the process is decomposed, what a user can observe, and which ergonomic
+        layers sit on top. It is not an API reference, an ADR, or a sprint plan.
+        Binding micro-decisions stay in the implementation. After the code and this
+        file diverge, update the file so names, behavior, and status match the
+        decision. Do not assume they match without reading both.
+
+    - name: App
+      value: |
+        A deployable runtime. Here, the [[App]] is the `ncp` process: one binary
+        that either serves the proxy, lists the cache, or purges it.
+
+    - name: System
+      value: |
+        The [[App]] plus the optional [[Redis Server]] and the [[Upstream Registry]]
+        it calls. SQLite and the package directory are inside the [[App]] boundary.
+
+    - name: Status
+      description: Lifecycle of a node in this file.
+      value:
+        - name: idea
+          value: Decided as a possibility. No behavior to rely on.
+        - name: in-progress
+          value: Implementation has started and is not yet usable.
+        - name: partial
+          value: |
+            Some of the contract is in the binary and some is not. Tests for a
+            partial node must assert the sentences that describe current behavior,
+            and must treat the unmet "must" sentences as known gaps.
+        - name: review
+          value: Implemented and waiting for a person to accept it.
+        - name: done
+          value: The contract in `value` is what the binary does.
+
+    - name: Service
+      value: |
+        A long-running process. [[ncp]] is the only service this repository owns.
+        A function is not a service.
+
+    - name: Subsystem
+      value: |
+        A large area of responsibility inside [[ncp]], composed of [[Module]] nodes.
+
+    - name: Module
+      value: |
+        A cohesive block of code inside a [[Subsystem]]. Not a screen.
+
+    - name: Layer
+      value: |
+        An organizational boundary inside [[ncp]]. The proxy talks to storage only
+        through the [[Storage Contract]]. The CLI talks to the proxy. Neither layer
+        is its own process.
+
+    - name: Storage
+      value: |
+        Durable capture of a [[DataModel]]. [[SQLite Backend]] and [[Redis Backend]]
+        are storage. The package directory is storage for [[Tarball]] bytes.
+
+    - name: State
+      value: |
+        In-memory data. [[L1 Metadata Cache]] and the [[Access Tracker]] are state.
+        They may be rebuilt or lost without corrupting the cache; the worst case is
+        a refetch or a shortened TTL.
+
+    - name: Cache
+      value: |
+        A bounded-lifetime copy of an [[Upstream Registry]] response. A cache miss
+        is allowed to become a hit later. A crash may drop hot state. It must not
+        be treated as the registry of record.
+
+    - name: DataModel
+      value: |
+        The shape of one record passed between modules. [[Package Metadata]] and
+        [[Tarball Record]] are the models that matter on the request path.
+
+    - name: Contract
+      value: |
+        The agreement at a boundary: operations, success, and error meaning.
+        [[Storage Contract]] is the storage boundary. [[Request Router]] is the HTTP boundary.
+
+    - name: ExternalSystem
+      value: |
+        A system outside this repository. [[Upstream Registry]] is required.
+        [[Redis Server]] is required only when the operator selects Redis.
+
+    - name: Boundary
+      value: |
+        A trust or process line. The operator's machine trusts [[ncp]]. [[ncp]]
+        trusts the [[Upstream Registry]] for bytes and does not add authentication
+        of its own. Clients are whoever can open the listen address.
+
+    - name: Policy
+      value: |
+        A rule applied on every relevant operation. [[Sliding Expiration]] and the
+        "cache the body even when the upstream status is not examined" rule are
+        policies.
+
+    - name: Workflow
+      value: |
+        A multi-step outcome. "npm install through the proxy" is the primary workflow.
+
+    - name: Log
+      value: |
+        A timestamped diagnostic line. Access logs are a [[Flourish]] on top of
+        serving. They must not change the response.
+
+    - name: Feature
+      value: |
+        Behavior a registry client or an operator can rely on for the product to
+        do its job.
+
+    - name: Flourish
+      value: |
+        An ergonomic layer. The underlying [[Feature]] still works with the flourish
+        turned off.
+
+    - name: Package Metadata
+      value: |
+        The JSON document the npm registry returns for a package URL, such as
+        `/lodash` or `/@types/react`. The proxy stores that document and later
+        serves it as `application/json`.
+
+    - name: Tarball
+      value: |
+        The `.tgz` file npm downloads for one package version. It is already a
+        gzip-compressed tar archive. The proxy must keep those bytes intact.
+
+    - name: Tarball Record
+      value: |
+        The pointer from a tarball URL to the file on disk: package name, version,
+        absolute or configured path, size, an empty checksum, and timestamps.
+
+    - name: Upstream Registry
+      value: |
+        The registry being cached. Default is `https://registry.npmjs.org`.
+        It speaks the npm URL layout: metadata documents, and tarball URLs that
+        end in `.tgz`. ncp does not vendor a registry and does not require a
+        particular implementation beyond that layout.
+
+    - name: Cache Key
+      value: |
+        `{prefix}{url path}` for [[Package Metadata]]. `{prefix}{url path}:tarball`
+        for a [[Tarball Record]]. The default prefix is `ncp-`. The query string
+        is not part of the key.
+
+    - name: Sliding Expiration
+      value: |
+        A cache hit extends how long the entry may live. The extension is recorded
+        on read. See [[Honor Configured TTL]] for the gap between Redis and SQLite.
+
+    - name: Registry Client
+      value: |
+        npm, pnpm, yarn, or any client pointed at this proxy with
+        `registry=http://<listen>`. The client believes it is talking to a registry.
+
+technical:
+  name: Technical
+  description: |
+    Allowlist. New code uses these. Do not add a framework, driver, or store
+    that is not listed here unless this section is updated first.
+  value:
+
+    - name: Primary Language
+      description: Module github.com/pkgems/npm-cache-proxy
+      value: Go 1.24
+
+    - name: HTTP Framework
+      description: Request routing and responses inside [[Registry Proxy]].
+      value: github.com/gin-gonic/gin
+
+    - name: Logging
+      description: Access log implementation behind [[Operator Logging]].
+      value: go.uber.org/zap and github.com/gin-contrib/zap
+
+    - name: CLI Parser
+      description: Flag grammar for [[Configuration]].
+      value: github.com/docopt/docopt-go
+
+    - name: Metadata Storage
+      description: |
+        One of two backends, selected at process start. SQLite is the default.
+      value: |
+        modernc.org/sqlite through database/sql (pure Go, no CGO), or
+        github.com/go-redis/redis v6 when the operator selects Redis.
+
+    - name: Tarball Storage
+      description: Bytes for a [[Tarball]]. Not stored inside SQLite or Redis.
+      value: |
+        A directory on the local filesystem. Default `./data/packages`.
+        Created on startup when SQLite is selected.
+
+    - name: Upstream Client
+      description: How [[ncp]] calls the [[Upstream Registry]].
+      value: |
+        net/http.Client with a shared Transport: 100 idle connections, 10 idle
+        per host, 90s idle timeout, compression allowed, 5 minute client timeout.
+
+    - name: Testing
+      description: How a node is verified.
+      value: |
+        `go test ./...` via the Makefile. The repository currently has no
+        `_test.go` files. New tests are derived from the `value` of the node
+        being built. Architectural nodes get unit tests. Feature nodes get
+        acceptance tests in the given/when/then shape of their `value`.
+
+    - name: Distribution
+      description: How an operator gets the binary.
+      value: |
+        `go build -o ncp .` for local use. `make release` cross-compiles with gox
+        to linux/amd64, linux/arm64, darwin/amd64, and darwin/arm64. A Dockerfile
+        exists and is behind the module's Go version; see [[Container Image]].
+
+general:
+  name: General
+  description: What this product is, and what it is not.
+  value:
+
+    - name: Name
+      description: Binary, module, and product name.
+      value: |
+        npm-cache-proxy. The command is `ncp`. The Go module is
+        github.com/pkgems/npm-cache-proxy.
+
+    - name: Description
+      value: |
+        ncp is a small caching proxy that sits in front of an npm registry.
+        The first time a client asks for a package, ncp fetches it from the
+        upstream registry, stores it, and answers. The next time, it answers
+        from that store. Point npm at it with `npm config set registry`.
+
+    - name: Motivation
+      value: |
+        Repeated installs of the same packages should not keep round-tripping
+        to the public registry. Teams on a slow or metered link, and developers
+        who reinstall often, need a cache on a machine they already have.
+        A single Go binary with an embedded database does that without standing
+        up Redis. Redis remains available when several ncp processes must share
+        one cache. Without ncp, every install talks to the upstream registry.
+
+    - name: Target Audience
+      value: |
+        A developer running npm, pnpm, or yarn on one machine, and an operator
+        who wants a local or team registry cache. The programmatic audience is
+        a Go caller who embeds [[Registry Proxy]] instead of shelling out to `ncp`.
+
+    - name: License
+      value: MIT. Copyright 2019 stackdumper.
+
+    - name: Out of Scope
+      value: |
+        ncp is not a private registry, a publisher, an authenticator, or a
+        malware scanner. It does not rewrite package code. It does not replicate
+        between machines. It does not cap cache size, even though a count flag
+        is accepted; see [[Cache Size Limit]].
+
+architectural:
+  name: Architectural
+  description: |
+    Top-down decomposition of [[ncp]]. Build a [[Service]] before its
+    [[Subsystem]] nodes, and a subsystem before its [[Module]] nodes.
+    The request-path diagrams are in docs/architecture.md.
+  value:
+
+    - name: ncp
+      type: Service
+      status: done
+      description: |
+        The process. [[Command Line]] selects serve, list, or purge, builds a
+        [[Registry Proxy]] over [[Cache Storage]], and on serve owns the HTTP
+        listener and shutdown. Given no subcommand, the process must listen
+        until SIGINT or SIGTERM or a listen error. Given `ncp list` or
+        `ncp purge`, it must open storage, perform that one operation, close
+        storage, and exit. Given an unknown storage backend name, it must exit
+        with an error naming redis and sqlite as the only choices. The listen
+        address, upstream, TTL, prefix, and package directory are read once at
+        startup and then supplied to the proxy on every request through
+        GetOptions, so a future caller can vary them per request without
+        changing the router.
+      value:
+
+        - name: Command Line
+          type: Subsystem
+          status: done
+          description: |
+            Process entry. Parses flags, applies environment overrides, and runs one
+            of serve, list, or purge. Lives in package `cli`, called from `main`.
+          value:
+            - name: Argument Parser
+              type: Module
+              status: done
+              value: |
+                Must accept the grammar printed by `ncp --help`. A flag present on
+                the command line wins. Otherwise the matching environment variable
+                wins. Otherwise the default wins. Boolean flags `--silent` and
+                `--dev` are also true when SILENT or DEV is `1` or `true`. An
+                unparseable invocation must exit non-zero. Defaults are listed on
+                [[Configuration]].
+
+            - name: Server Runner
+              type: Module
+              status: done
+              value: |
+                Must construct storage through [[Storage Factory]], adapt it to the
+                proxy database interface, and call ListenAndServe on the proxy's
+                HTTP server. On SIGINT or SIGTERM it must stop accepting, give
+                in-flight HTTP 10 seconds to finish, then Close storage. A listen
+                error follows the same close path. Close failures are logged and
+                do not change the fact that shutdown was attempted.
+
+            - name: List Command
+              type: Module
+              status: done
+              value: |
+                Must print each cached path on its own line with the key prefix
+                removed once, then close storage. Given storage that cannot be
+                opened because the database file or directory is missing, it must
+                tell the operator to run `ncp` first and exit non-zero.
+
+            - name: Purge Command
+              type: Module
+              status: done
+              value: |
+                Must delete every key [[Cache Storage]] returns for the configured
+                prefix, then close storage. The same missing-database message as
+                [[List Command]] applies. What "every key" includes depends on the
+                backend; see [[Purge Cached Paths]].
+
+        - name: Registry Proxy
+          type: Subsystem
+          status: done
+          description: |
+            HTTP behavior of an npm registry, plus a cache in front of the
+            [[Upstream Registry]]. Package `proxy`. It depends on a database that
+            satisfies [[Storage Contract]] and on [[Upstream Client]].
+          value:
+            - name: Request Router
+              type: Module
+              status: done
+              value: |
+                Gin runs in release mode. Routes:
+                GET `/:scope/:name` and GET `/:scope` are [[Package Metadata]] and
+                go to [[Metadata Cache]]. Any other path is the no-route handler.
+                A path containing `.tgz` on GET or HEAD is a [[Tarball]] and goes
+                to [[Tarball Cache]]. GET or HEAD `/` is [[Health Check]]. Any
+                other GET or HEAD is [[Uncached Proxy]]. POST, PUT, DELETE, and
+                other methods are [[Uncached Proxy]] and must not be answered with
+                a redirect, so a client cannot skip the proxy by following one.
+                Given GetOptions fails, the response is HTTP 500.
+
+            - name: Metadata Cache
+              type: Module
+              status: done
+              value: |
+                Given a path, the cache key is [[Cache Key]] for metadata. Given a
+                hit, return those bytes and call [[Sliding Expiration]]; a refresh
+                error is logged and the hit is still returned. Given a miss whose
+                error is exactly `key not found` or `redis: nil`, GET
+                `{upstream}{path}` with the client's headers and `Accept-Encoding:
+                gzip`. If the upstream body is gzip-encoded, decompress it before
+                storing. Rewrite every `"tarball":"http…/…` or `"tarball":"https…/…`
+                value so the tarball URL points at `http://{request Host}/`. Store
+                the rewritten document with the configured TTL. Given the store
+                fails, still return the document. The HTTP response is always 200
+                `application/json` with `Cache-Control: public, max-age={ttl seconds}`.
+                The upstream status code is not consulted. A database error other
+                than a miss is HTTP 500 and nothing is stored.
+
+            - name: Tarball Cache
+              type: Module
+              status: done
+              value: |
+                Given an empty package directory, download the tarball into memory
+                and respond with those bytes. Do not write a [[Tarball Record]].
+                Given a package directory, the cache key is the metadata key plus
+                the suffix `:tarball`. Given a hit whose file still exists, refresh
+                expiration and stream that file. Given a hit whose file is gone,
+                treat it as a miss. Given a miss, download once (see
+                [[Download Deduplicator]]), stream the bytes to a file under the
+                package directory, fsync, and refuse to publish an empty file or a
+                file whose size does not match the number of bytes written. A
+                partial file is removed. Store the absolute path as the record
+                value with the configured TTL. If that store fails, the file remains
+                and the request still succeeds. The response is
+                `application/octet-stream` via `http.ServeFile` when a path exists,
+                so the kernel can sendfile and memory stays a small buffer. The
+                same Cache-Control header as metadata is set.
+                The on-disk name is the URL path with the leading slash removed,
+                `/` replaced by `_`, `@` replaced by `_at_`, and `..` reduced to
+                the base name.
+
+            - name: Download Deduplicator
+              type: Module
+              status: done
+              value: |
+                Given two requests for the same tarball key at once, only one
+                upstream download runs. The others wait on a channel, then read
+                the record the winner stored. The lock is removed when the winner
+                finishes, including when the winner fails. A waiter that still
+                finds no file may download itself.
+
+            - name: Tarball Byte Policy
+              type: Module
+              status: done
+              value: |
+                A `.tgz` body is a gzip-compressed tar. The upstream request for a
+                file download must not send `Accept-Encoding`, so the registry is
+                not asked to compress the bytes a second time. If a response
+                nonetheless arrives with `Content-Encoding: gzip`, that HTTP
+                compression is removed and the remaining bytes are what get stored.
+                The stored file must still be a valid `.tgz` for npm.
+
+            - name: Uncached Proxy
+              type: Module
+              status: partial
+              value: |
+                Search, `/-/all`, and any method that is not a cached metadata or
+                tarball read must be forwarded to the upstream URL. Method, body,
+                and headers are copied. The Host header is dropped so the client
+                sets it. Upstream status, headers, and body are copied back.
+                A connection failure is HTTP 502. The query string must be
+                forwarded once. Today the no-route GET path concatenates the raw
+                query onto the path and the forwarder may append it again with
+                `?`, so a GET with a query string can be forwarded incorrectly.
+
+            - name: Health Check
+              type: Module
+              status: done
+              value: |
+                GET `/` calls storage Health. Success is HTTP 200 `{"ok": true}`.
+                Failure is HTTP 503. SQLite health is a ping with a 5 second timeout.
+                Redis health is PING.
+
+        - name: Cache Storage
+          type: Subsystem
+          status: done
+          description: |
+            Package `internal/storage`. The proxy never imports a driver. It sees
+            [[Storage Contract]] through an adapter in the CLI.
+          value:
+            - name: Storage Contract
+              type: Contract
+              status: done
+              value: |
+                Get(key) returns the stored string, or an error whose text is
+                `key not found` for SQLite and `redis: nil` for Redis when absent.
+                Set(key, value, ttl) stores the value and its lifetime. Delete
+                removes it. Keys(prefix) returns unexpired keys with that prefix.
+                RefreshExpiration(key, ttl) records a hit and must not fail the
+                read; a missing key is a no-op. Health reports whether the backend
+                can be reached. Close releases the backend. SQLite Close must flush
+                access times and checkpoint before the process exits.
+
+            - name: Storage Factory
+              type: Module
+              status: partial
+              value: |
+                NewStorage builds Redis or SQLite from a config struct. Unknown
+                backend names return an error. SQLite is then wrapped by
+                [[L1 Metadata Cache]] only when EnableL1Cache is true.
+                DefaultConfig sets backend sqlite, L1 enabled, L1 max age 5 minutes,
+                access flush 30 seconds, and a pool of 1 connection with no lifetime.
+                The CLI does not use DefaultConfig. It fills the struct from flags,
+                leaves EnableL1Cache false, and leaves the access-flush field zero
+                (the SQLite constructor then applies 30 seconds itself).
+
+            - name: Redis Backend
+              type: Module
+              status: done
+              value: |
+                A thin wrapper over go-redis. Get/Set/Del/Keys/Ping map directly.
+                RefreshExpiration calls EXPIRE with the supplied TTL when the key
+                exists. Close closes the client. There is no file cleanup; tarball
+                paths are ordinary string values under the tarball [[Cache Key]].
+                An older [[Database Redis]] type in package proxy implements the
+                same operations for callers who construct the proxy by hand and do
+                not use the factory.
+
+            - name: SQLite Backend
+              type: Module
+              status: done
+              value: |
+                Opens `sqlite` on the configured file with modernc.org/sqlite,
+                creates parent directories for the database and the package dir,
+                applies [[SQLite Pragmas]], creates [[SQLite Schema]], and starts
+                three background loops: [[WAL Checkpoint Manager]],
+                [[Expiration Cleanup]], and [[Access Tracker]]. Busy and locked
+                errors on Get and Set are retried up to three times with backoff
+                starting at 10ms. A miss is not retried.
+
+            - name: SQLite Schema
+              type: DataModel
+              status: partial
+              value: |
+                `registry_cache` is the live metadata table: key, value, created_at,
+                expires_at, primary key on key, index on expires_at. Metadata Get
+                and Set use only this table. Set updates in place and inserts when
+                no row matched.
+                `tarballs` is the live tarball table: package_name, version,
+                file_path, size, checksum, created_at, expires_at, primary key
+                (package_name, version). A key ending in `:tarball` is parsed into
+                package name and version and stored here, not in registry_cache.
+                Checksum is stored as an empty string. Size comes from the file.
+                `packages_metadata` is created and included in expiration cleanup,
+                and the proxy never writes it. It must not be required to serve a
+                request.
+
+            - name: Tarball Key Parser
+              type: Module
+              status: partial
+              value: |
+                A tarball path looks like `/lodash/-/lodash-4.17.21.tgz` or
+                `/@types/react/-/react-18.2.0.tgz`. Package name is the segment
+                before `/-/`. Version is the text after the last hyphen in the
+                filename, with `.tgz` removed. Lookup, store, delete, and flush
+                must strip the configured key prefix before parsing. Today they
+                strip the literal `ncp-`. A non-default prefix therefore fails
+                tarball metadata operations even when metadata operations succeed.
+
+            - name: L1 Metadata Cache
+              type: Module
+              status: partial
+              value: |
+                An in-memory map in front of any [[Storage Contract]]. Given a fresh
+                entry younger than max age, Get returns it and does not call the
+                backend. Given a stale entry, Get deletes it and reads the backend,
+                then stores the result. Set writes the backend first and the map
+                second. Delete drops both. RefreshExpiration refreshes the map
+                timestamp when the key is present and always delegates. Keys,
+                Health, and Close delegate. The CLI server must enable this wrapper
+                for SQLite. Today it does not, because [[Storage Factory]] only
+                wraps when EnableL1Cache is set and the CLI leaves it false.
+
+            - name: Access Tracker
+              type: Module
+              status: partial
+              value: |
+                SQLite RefreshExpiration stores key → unix seconds in a sync.Map and
+                returns. It must not write the database on that call. A goroutine
+                flushes the map on an interval and once more when Close begins.
+                The flush updates expires_at inside one transaction, for
+                registry_cache by key and for tarballs by parsed name and version,
+                then drops the flushed entries. See [[Honor Configured TTL]] for
+                the lifetime it writes. An empty map is a no-op. One bad key is
+                logged and does not abort the batch.
+
+            - name: WAL Checkpoint Manager
+              type: Module
+              status: done
+              value: |
+                On the checkpoint interval (default 5 minutes) run
+                `PRAGMA wal_checkpoint(TRUNCATE)`, then PASSIVE, then RESTART,
+                stopping at the first success. Then measure the `-wal` file.
+                Given a WAL larger than the alert threshold (default 50 MB), log a
+                warning that includes the database size. Given a non-empty database
+                whose WAL is more than five times the database, log a query-leak
+                warning. On Close, after the access flush, run a final checkpoint
+                (PASSIVE, then TRUNCATE), close the database, remove the `-shm`
+                file, and remove the `-wal` file when it is empty. Checkpoint
+                failure is a warning and must not skip Close.
+
+            - name: Expiration Cleanup
+              type: Module
+              status: done
+              value: |
+                On the cleanup interval (default 1 hour), delete rows whose
+                expires_at is at or before now from registry_cache,
+                packages_metadata, and tarballs. Before deleting tarball rows,
+                collect their file paths and remove those files. A missing file is
+                not an error. Reads also ignore expired rows, so a row may be
+                invisible before the sweeper deletes it.
+
+            - name: SQLite Pragmas
+              type: Module
+              status: done
+              value: |
+                On open, set `journal_mode=WAL` and `busy_timeout=5000`. Also
+                attempt `synchronous=NORMAL` and `cache_size=-64000` (64 MB). A
+                failure of an optional pragma is a warning and startup continues.
+                `temp_store` and `mmap_size` are not set.
+
+            - name: Connection Pool
+              type: Module
+              status: partial
+              value: |
+                The pool is whatever the config struct says. The performance
+                contract for SQLite is one open connection, one idle connection,
+                and no max lifetime, so the single writer is not contested by a
+                pool. [[Storage Factory]] DefaultConfig uses that contract. The
+                CLI applies 25 open, 5 idle, and 5 minutes, which is what `ncp`
+                uses unless the operator overrides the flags.
+
+        - name: Database Redis
+          type: Module
+          status: done
+          description: |
+            Legacy constructor in package proxy for embedders who already hold a
+            go-redis client. Same operations as [[Redis Backend]] except it has
+            no Close method. The example program uses it.
+          value: |
+            Get, Set, Delete, Keys, RefreshExpiration, and Health must behave like
+            [[Redis Backend]]. Embedders who need Close use [[Storage Factory]]
+            instead.
+
+features:
+  name: Features
+  description: |
+    What a [[Registry Client]] or an operator can observe. Each feature names
+    the architectural nodes it depends on. Ship a capability before its children.
+  value:
+
+    - name: Registry Proxying
+      description: |
+        The client sets its registry to ncp and installs packages. Delivered
+        by [[Registry Proxy]] over [[Cache Storage]].
+      status: done
+      value:
+        - name: First Install Fetches
+          status: done
+          value: |
+            Given an empty cache and a client whose registry is the listen
+            address, when the client installs a package, ncp must request that
+            package's metadata and tarballs from the [[Upstream Registry]],
+            store them, and return them so the install succeeds.
+
+        - name: Second Install Hits
+          status: done
+          value: |
+            Given the same packages already cached, when the client removes
+            node_modules and installs again, ncp must answer metadata from
+            storage and tarballs from disk without asking the upstream for
+            those URLs.
+
+        - name: Metadata URL Rewrite
+          status: done
+          value: |
+            Given a metadata document whose tarball fields point at the
+            upstream host, the stored and served document must point those
+            fields at `http://` plus the Host the client used to reach ncp,
+            so the client downloads tarballs from ncp.
+
+        - name: Scoped Packages
+          status: done
+          value: |
+            Given a scope such as `@types/react`, metadata is served from the
+            two-segment route and the tarball path
+            `/@types/react/-/react-{version}.tgz` is served from the tarball
+            path. Names are preserved in storage. Only the on-disk filename
+            encodes `@` as `_at_`.
+
+        - name: Concurrent Tarball Miss
+          status: done
+          value: |
+            Given many clients requesting one uncached tarball at the same
+            time, exactly one upstream download runs, and every waiter that
+            finds the published file receives a stream of that file.
+
+        - name: Large Tarball Stream
+          status: done
+          value: |
+            Given a cached tarball larger than memory comfortably holds many
+            times over, the response must start streaming from the file rather
+            than buffering the whole file. Memory per request stays on the
+            order of the copy buffer.
+
+        - name: Upstream Failure
+          status: done
+          value: |
+            Given the upstream cannot be dialed for a metadata or tarball miss,
+            the client receives HTTP 500. Given a non-cached forward that
+            cannot be dialed, the client receives HTTP 502. Nothing new is
+            stored.
+
+        - name: Corrupt Or Empty Download
+          status: done
+          value: |
+            Given an upstream tarball body of length zero, or a file whose
+            size does not match the bytes written, ncp must delete the file
+            and return an error. It must not publish that path.
+
+    - name: Cache Lifetime
+      description: |
+        How long a stored document or tarball pointer remains readable.
+        Uses [[Access Tracker]], [[Expiration Cleanup]], and [[Redis Backend]].
+      status: partial
+      value:
+        - name: Initial TTL
+          status: done
+          value: |
+            Given a miss that is stored, the entry must remain readable until
+            the configured TTL elapses with no further hit. The default TTL
+            is 3600 seconds. Redis applies it as a native TTL. SQLite stores
+            expires_at as now plus that TTL and hides the row once now passes
+            it, even if the sweeper has not run.
+
+        - name: Honor Configured TTL
+          status: partial
+          value: |
+            Given a hit, Redis must set the key TTL to the configured cache
+            TTL immediately. SQLite must record the hit in memory and, on
+            flush, set expires_at to that access time plus the TTL passed into
+            RefreshExpiration. A crash may lose at most one flush interval of
+            hits. Today the SQLite flush sets expires_at to access time plus
+            24 hours and ignores the TTL argument, so a short `--cache-ttl`
+            still jumps to 24 hours after the first flush.
+
+        - name: Expired Rows Stay Invisible
+          status: done
+          value: |
+            Given expires_at in the past, Get must report a miss and Keys must
+            omit the key, on both backends. The hourly sweeper then deletes
+            SQLite rows and the tarball files those rows named.
+
+        - name: Cache Size Limit
+          status: partial
+          value: |
+            Given `--cache-limit 0`, there is no count cap. Given a positive
+            count, the cache must not retain more than that many package
+            entries. The flag and CACHE_LIMIT are parsed. Nothing reads them,
+            so a positive limit does not evict.
+
+    - name: Storage Choice
+      description: |
+        The operator picks a backend at startup. Both satisfy
+        [[Storage Contract]]. Metadata and tarball bytes use the same proxy.
+      status: done
+      value:
+        - name: SQLite Single Binary
+          status: done
+          value: |
+            Given `--storage-backend sqlite` or no backend flag, ncp must run
+            with no separate database process. Metadata lives in the sqlite
+            file. Tarball bytes live in the package directory. Restarting ncp
+            must see the same unexpired entries.
+
+        - name: Redis Shared Cache
+          status: done
+          value: |
+            Given `--storage-backend redis` and a reachable [[Redis Server]],
+            metadata and tarball paths live as Redis strings under the
+            configured prefix. Two ncp processes pointed at that server share
+            those keys. Tarball bytes still live on each machine's package
+            directory, so a shared Redis does not by itself share the files.
+
+        - name: Backend Mismatch Is an Error
+          status: done
+          value: |
+            Given a backend name other than `redis` or `sqlite`, ncp must
+            refuse to start and must not listen.
+
+    - name: Cache Administration
+      description: |
+        Operator commands over the same storage the server uses.
+        [[List Command]] and [[Purge Command]].
+      status: partial
+      value:
+        - name: List Cached Paths
+          status: partial
+          value: |
+            `ncp list` prints one de-prefixed key per line for every unexpired
+            key the backend returns. SQLite returns only `registry_cache` keys,
+            so tarball rows do not appear. Redis returns every matching key,
+            including keys that end in `:tarball` when those were stored.
+
+        - name: Purge Cached Paths
+          status: partial
+          value: |
+            `ncp purge` deletes each key from Keys(prefix). On Redis that
+            removes metadata and tarball pointer keys; it does not delete
+            files in the package directory. On SQLite, Keys does not see the
+            tarballs table, so purge removes metadata rows and leaves tarball
+            rows and files in place until they expire and [[Expiration Cleanup]]
+            runs. A complete purge must also remove tarball rows and the files
+            they name.
+
+    - name: Configuration
+      description: |
+        Every operator knob, flag first, then environment, then default.
+        Parsed by [[Argument Parser]].
+      status: done
+      value: |
+        Common: `--listen` / LISTEN_ADDRESS default `localhost:8080`.
+        `--upstream` / UPSTREAM_ADDRESS default `https://registry.npmjs.org`.
+        `--silent` / SILENT. `--dev` / DEV. `--cache-limit` / CACHE_LIMIT
+        default `0` (accepted, not enforced; see [[Cache Size Limit]]).
+        `--cache-ttl` / CACHE_TTL default `3600` seconds.
+        `--storage-backend` / STORAGE_BACKEND default `sqlite`.
+        Redis: `--redis-address` / REDIS_ADDRESS default `localhost:6379`.
+        `--redis-database` / REDIS_DATABASE default `0`.
+        `--redis-password` / REDIS_PASSWORD default empty.
+        `--redis-prefix` / REDIS_PREFIX default `ncp-`. The prefix is also
+        the metadata key prefix for SQLite.
+        SQLite: `--sqlite-db-path` / SQLITE_DB_PATH default `./data/cache.db`.
+        `--package-dir` / PACKAGE_DIR default `./data/packages`.
+        `--sqlite-checkpoint-interval` / SQLITE_CHECKPOINT_INTERVAL default `5m`.
+        `--sqlite-cleanup-interval` / SQLITE_CLEANUP_INTERVAL default `1h`.
+        `--sqlite-wal-size-alert-mb` / SQLITE_WAL_SIZE_ALERT_MB default `50`.
+        `--sqlite-max-open-conns` / SQLITE_MAX_OPEN_CONNS default `25`.
+        `--sqlite-max-idle-conns` / SQLITE_MAX_IDLE_CONNS default `5`.
+        `--sqlite-conn-max-lifetime` / SQLITE_CONN_MAX_LIFETIME default `5m`.
+        Access flush interval is not a flag. It defaults to 30 seconds inside
+        [[SQLite Backend]]. L1 is not a flag. See [[L1 Metadata Cache]].
+
+    - name: Library Embedding
+      description: |
+        A Go program constructs [[Registry Proxy]] itself. The example under
+        `example/` does this with [[Database Redis]].
+      status: done
+      value: |
+        Given a Proxy with a Database and an HttpClient, Server must return an
+        `*http.Server` bound to ListenAddress whose handler is the router in
+        [[Request Router]]. GetOptions is called per request and supplies
+        prefix, TTL, upstream, and package directory. The CLI is a client of
+        this same constructor. An embedder who wants SQLite uses
+        [[Storage Factory]] and the CLI adapter's method set, which is Get,
+        Set, Delete, Keys, RefreshExpiration, and Health.
+
+    - name: Process Lifecycle
+      description: |
+        Shutdown and startup side effects of [[Server Runner]].
+      status: done
+      value: |
+        Startup creates the sqlite directory and the package directory when
+        SQLite is selected, and logs the listen address. Shutdown on signal
+        stops HTTP within 10 seconds, flushes SQLite access times, checkpoints,
+        and unlocks the database file so another tool can open it. A second
+        `ncp list` against a running server is a second connection to the same
+        file; WAL mode must allow that read.
+
+    - name: Health Probe
+      description: |
+        [[Health Check]] for process supervisors.
+      status: done
+      value: |
+        Given a healthy backend, GET `/` returns 200 and `{"ok": true}`.
+        Given a backend that does not answer, GET `/` returns 503. This route
+        is not cached and is not forwarded upstream.
+
+    - name: Pass-through Registry Routes
+      description: |
+        Registry endpoints that are not package documents or tarballs.
+        [[Uncached Proxy]].
+      status: partial
+      value: |
+        Given a client request for a path that is not package metadata, not a
+        `.tgz`, and not `/`, ncp must forward it to the upstream and return
+        the upstream status and body unchanged. Publish and other non-GET
+        methods take this path too. The query string must survive as one
+        query string. See [[Uncached Proxy]] for the current double-append gap.
+
+flourishes:
+  name: Flourishes
+  description: |
+    Ergonomics on top of completed features. Turning a flourish off must leave
+    the feature working.
+  value:
+
+    - name: Operator Logging
+      description: |
+        How the process talks to a human or a log collector. The registry
+        responses do not depend on it. Uses [[Logging]].
+      value:
+        - name: JSON Access Log
+          status: done
+          value: |
+            Given neither `--silent` nor `--dev`, each request is logged as
+            production JSON through zap, including recovery on panic. This is
+            the default.
+
+        - name: Dev Access Log
+          status: done
+          value: |
+            Given `--dev`, access lines are human-readable
+            `[LEVEL]  METHOD path -> status (latency)`. Lines longer than 120
+            characters are truncated with an ellipsis. A debug line is also
+            printed for every request before handling, including the query
+            string and Host. Error paths in the handlers print `[ERROR]` lines
+            only when `--dev` is set.
+
+        - name: Silent Mode
+          status: done
+          value: |
+            Given `--silent`, request logging is off. Panic recovery stays on.
+            Caching, streaming, and command output are unchanged. `ncp list`
+            still prints paths.
+
+    - name: Response Cache Hints
+      description: |
+        Advises the client how long it may reuse a response. The proxy's own
+        TTL is independent and is [[Sliding Expiration]].
+      value:
+        - name: Cache-Control Header
+          status: done
+          value: |
+            Given a metadata or tarball response, `Cache-Control` must be
+            `public, max-age=` plus the configured TTL in seconds. Disabling
+            the header would be a flourish removal; the body must still be the
+            cached document or file.
+
+    - name: SQLite Care
+      description: |
+        Warnings and shutdown tidiness so a long-running SQLite cache does not
+        surprise an operator. Serving does not wait on these warnings.
+      value:
+        - name: WAL Growth Warning
+          status: done
+          value: |
+            Given a WAL file over the configured megabyte threshold, or a WAL
+            more than five times the database file, the process logs a warning
+            on the checkpoint tick. The request path does not change.
+
+        - name: Unlock on Exit
+          status: done
+          value: |
+            Given a clean shutdown, the `-shm` file is removed and an empty
+            `-wal` file is removed so a SQLite browser can open the database
+            file. A failed checkpoint logs a warning and the process still
+            closes the handle.
+
+    - name: Container Image
+      description: |
+        A published image is advertised for operators who do not build Go.
+        The Dockerfile in the repository is not the current module.
+      value:
+        - name: Image Tracks the Module
+          status: partial
+          value: |
+            A container build must compile this module with the Go version in
+            [[Primary Language]], produce the `ncp` binary, listen on
+            `0.0.0.0:8080` inside the image, and persist `/srv` data for the
+            sqlite file and package directory across restarts. The Dockerfile
+            in the tree uses `golang:1.12-alpine`, builds an output named
+            `build`, and only sets LISTEN_ADDRESS. It cannot be the shipping
+            image until it matches the module.
+
+    - name: Local Proof Script
+      description: |
+        `example/` is a tiny npm project and a shell script an operator can
+        run against a dev server. It is not part of the proxy process.
+      value:
+        - name: Example Install
+          status: done
+          value: |
+            Given `ncp --dev` on localhost:8080 and `example/.npmrc` pointing
+            at that registry, `example/test-cache.sh` must fail fast when the
+            proxy is down, install the example dependencies once, report
+            whether `data/cache.db` and `data/packages` gained entries, and
+            install a second time after clearing node_modules. The script is
+            a manual check, not a `go test`.

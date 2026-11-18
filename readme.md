@@ -1,32 +1,15 @@
-<div align="center">
-  <img width="450" src="./logo.png"> 
-
-  <h1>npm-cache-proxy</h1>
-
-  <a href="https://hub.docker.com/r/pkgems/npm-cache-proxy/tags">
-    <img src="https://img.shields.io/github/release/pkgems/npm-cache-proxy.svg" alt="Current Release" />
-  </a>
-  <a href="https://hub.docker.com/r/pkgems/npm-cache-proxy/builds">
-    <img src="https://img.shields.io/docker/cloud/build/pkgems/npm-cache-proxy.svg" alt="CI Build">
-  </a>
-  <a href="https://github.com/pkgems/npm-cache-proxy/blob/master/license">
-    <img src="https://img.shields.io/github/license/pkgems/npm-cache-proxy.svg" alt="Licence">
-  </a>
-</div>
-
-<br />
-<br />
+# npm-cache-proxy
 
 ## Introduction
 
 #### ⚡️ Performance
-NCP is a tiny but very fast caching proxy written in Go. It uses Redis for data storage, which in combination with the speed of Go makes it incredibly fast. NCP is well-optimized and can be run on almost any platform, so if you have a Raspberry Pi, you can install NCP as your local cache there.
+NCP is a tiny but very fast caching proxy written in Go. Cache metadata lives in one of two backends: SQLite, which is embedded and needs no extra process, or Redis, when several NCP processes should share one cache. Either backend, together with Go, keeps it fast. NCP is well-optimized and can be run on almost any platform, so if you have a Raspberry Pi, you can install NCP as your local cache there.
 
 #### ✨ Modularity
-NCP is modular. Now it has only one database adapter which is Redis. If you need support for any other database, feel free to open an issue or implement it [on your own](https://github.com/pkgems/npm-cache-proxy/blob/7c8b90ff6ba0656f60e3de915b9fb4eaabfb467b/proxy/proxy.go#L29) and then open a pull request (_bonus points_).
+NCP is modular. It ships with two storage backends, SQLite and Redis. SQLite is the default. Select Redis with `--storage-backend redis`. If you need support for any other database, feel free to open an issue or implement it [on your own](https://github.com/pkgems/npm-cache-proxy/blob/7c8b90ff6ba0656f60e3de915b9fb4eaabfb467b/proxy/proxy.go#L29) and then open a pull request (_bonus points_).
 
 #### 💡 Simplicity
-NCP is very simple. It just proxies requests to an upstream registry, caches response and returns cached response for next requests to the same package. Cached data are stored in Redis with an original request URL as a key.
+NCP is very simple. It just proxies requests to an upstream registry, caches the response, and returns the cached response for the next request to the same package. Cached metadata is stored in SQLite or Redis, with the original request URL as the key.
 
 
 <br />
@@ -39,14 +22,17 @@ NCP binaries for different paltforms can be downloaded can be downloaded on the 
 The quickies way to get started with NCP is to use Docker.
 
 ```bash
-# Run proxy inside of docker container in background
-docker run -e REDIS_ADDRESS=host.docker.internal:6379 -p 8080:8080 -it -d pkgems/npm-cache-proxy
+# Run with SQLite (the default) inside a container
+docker run -p 8080:8080 -it -d pkgems/npm-cache-proxy
 
-# Run locally with Redis (default)
-ncp --redis-address localhost:6379
+# Run with Redis inside a container
+docker run -e STORAGE_BACKEND=redis -e REDIS_ADDRESS=host.docker.internal:6379 -p 8080:8080 -it -d pkgems/npm-cache-proxy
 
-# Run locally with SQLite and human-readable logging
-ncp --dev 
+# Run locally with SQLite (the default) and human-readable logging
+ncp --dev
+
+# Run locally with Redis
+ncp --storage-backend redis --redis-address localhost:6379 
 
 # Configure npm to use caching proxy as registry
 npm config set registry http://localhost:8080
